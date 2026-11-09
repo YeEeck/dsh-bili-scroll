@@ -1,122 +1,89 @@
 // node --test test/
+// ⭐ 2026-11-09（02-provider-mirror）：白名单删了 —— 这里全部按「这一轮实际有什么」判断。
+//   可用集合 = DeepSeek 内置两条 + `env.available()`（index.js 传的是本轮从主 profile 镜像出来的 provider）。
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { readFileSync } from 'node:fs'
-import { providerState, chooseModel, isStockTemplate, FALLBACK_MODEL } from '../lib/model-select.mjs'
+import {
+  availableProviders, providerState, chooseModel, BASE_PROVIDERS, FALLBACK_MODEL,
+} from '../lib/model-select.mjs'
 
-const envOf = (profile, stock = false) => ({ profile: () => profile, templateIsStock: () => stock })
-const STOCK = envOf('bili-duty', true)        // 出厂的 bili-duty
-const EDITED = envOf('bili-duty', false)      // bundles 被改过的模板（#144）
-const CUSTOM = envOf('my-duty')               // 自建 profile（#175）
-const HEADLESS = envOf('headless')
-
+/** index.js 里的 modelEnv 就是这个形状：available() 返回本轮镜像到的 provider 名 */
+const envOf = (...providers) => ({ available: () => providers })
+const EMPTY = envOf()                       // 主 profile 没配第三方 provider
+const MIRRORED = envOf('lm-studio-wr', 'ocg-1')
 const ses = (provider, model = 'some-model') => ({ provider, model, source: 'session' })
 const pin = (provider, model = 'some-model') => ({ provider, model })
 const pick = (m) => [m.provider, m.source]
 
-test('#130 / #144 / #163：出厂 bili-duty + 没钉 + 会话是未知 provider ⇒ 退回兜底，不带着它去 NO_ADAPTER', () => {
-  const m = chooseModel({ pin: null, session: ses('custom-gw', 'gw-model') }, STOCK)
-  assert.deepEqual(m, {
+test('availableProviders：内置两条打底，镜像到的追加在后面并去重', () => {
+  assert.deepEqual(availableProviders(EMPTY), ['deepseek-account', 'deepseek-official'])
+  assert.deepEqual(availableProviders(MIRRORED),
+    ['deepseek-account', 'deepseek-official', 'lm-studio-wr', 'ocg-1'])
+  // 镜像结果重复 / 和内置重名都不该重复列
+  assert.deepEqual(availableProviders(envOf('ocg-1', 'deepseek-account', 'ocg-1')),
+    ['deepseek-account', 'deepseek-official', 'ocg-1'])
+  // 空值、非数组、抛错都只留内置两条（宁可少列，也不列一个必然 NO_ADAPTER 的）
+  assert.deepEqual(availableProviders(envOf('', null)), ['deepseek-account', 'deepseek-official'])
+  assert.deepEqual(availableProviders({ available: () => 'nope' }), BASE_PROVIDERS)
+  assert.deepEqual(availableProviders({ available: () => { throw new Error('boom') } }), BASE_PROVIDERS)
+  assert.deepEqual(availableProviders(undefined), BASE_PROVIDERS)
+  assert.deepEqual(availableProviders({ available: () => [' spaced ', ''] }), ['deepseek-account', 'deepseek-official', 'spaced'])
+})
+
+test('providerState：只有「这一轮真装了」才是 yes —— 不再有 maybe / 白名单', () => {
+  assert.equal(providerState('deepseek-account', EMPTY), 'yes')
+  assert.equal(providerState('deepseek-official', MIRRORED), 'yes')
+  assert.equal(providerState('lm-studio-wr', MIRRORED), 'yes')
+  // 主 profile 装没装、是不是某个特定 profile 专属 —— 都不算数，只看这一轮
+  assert.equal(providerState('lm-studio-wr', EMPTY), 'no')
+  assert.equal(providerState('google-antigravity', EMPTY), 'no')
+  assert.equal(providerState('google-antigravity', envOf('google-antigravity')), 'yes')
+  assert.equal(providerState('', EMPTY), 'no')
+  assert.equal(providerState(null, MIRRORED), 'no')
+})
+
+test('钉了 & 这一轮有 ⇒ 照用（source: plugin），不会被会话抢走', () => {
+  const m = chooseModel({ pin: pin('ocg-1', 'deepseek-v4.1-flash'), session: ses('deepseek-official') }, MIRRORED)
+  assert.deepEqual(m, { provider: 'ocg-1', model: 'deepseek-v4.1-flash', source: 'plugin' })
+})
+
+test('钉了 & 这一轮没有 ⇒ 仍按钉的用（不悄悄换），但标 unavailable 让设置页说清原因', () => {
+  for (const session of [ses('deepseek-account'), ses('community-x'), null]) {
+    const m = chooseModel({ pin: pin('not-installed', 'm1'), session }, EMPTY)
+    assert.deepEqual(m, { provider: 'not-installed', model: 'm1', source: 'plugin', unavailable: true })
+  }
+  // 镜像被拒 / 没读到配置 ⇒ 同样只是「这一轮没有」，不会换成别的模型
+  const m = chooseModel({ pin: pin('lm-studio-wr', 'm2'), session: ses('deepseek-account') }, envOf('ocg-1'))
+  assert.deepEqual(pick(m), ['lm-studio-wr', 'plugin'])
+  assert.equal(m.unavailable, true)
+})
+
+test('没钉 + 会话的 provider 这一轮有 ⇒ 跟随会话，effort 一起带上', () => {
+  const session = { ...ses('ocg-1', 'deepseek-v4.1-flash'), reasoningEffort: 'high' }
+  assert.deepEqual(chooseModel({ pin: null, session }, MIRRORED), session)
+  assert.deepEqual(chooseModel({ pin: null, session: ses('deepseek-official') }, EMPTY),
+    ses('deepseek-official'))
+})
+
+test('没钉 + 会话的 provider 这一轮没有 ⇒ DeepSeek 兜底，并把被丢掉的写进 sessionIgnored', () => {
+  assert.deepEqual(chooseModel({ pin: null, session: ses('community-x', 'gw-model') }, MIRRORED), {
     ...FALLBACK_MODEL,
     source: 'fallback',
-    sessionIgnored: { provider: 'custom-gw', model: 'gw-model' },
+    sessionIgnored: { provider: 'community-x', model: 'gw-model' },
   })
-})
-
-test('出厂 bili-duty + 没钉 + 会话是 Antigravity ⇒ 同样退回兜底', () => {
-  assert.deepEqual(pick(chooseModel({ pin: null, session: ses('google-antigravity') }, STOCK)), ['deepseek-account', 'fallback'])
-})
-
-test('没钉 + 会话是 DeepSeek ⇒ 跟随会话，effort 也带上', () => {
-  const session = { ...ses('deepseek-official', 'deepseek-pro'), reasoningEffort: 'high' }
-  assert.deepEqual(chooseModel({ pin: null, session }, STOCK), session)
+  // 会话是第三方、但主 profile 没镜像它（比如没装 / 被拒）⇒ 同样兜底
+  assert.deepEqual(pick(chooseModel({ pin: null, session: ses('lm-studio-wr') }, EMPTY)),
+    ['deepseek-account', 'fallback'])
 })
 
 test('没钉也没有会话 ⇒ 兜底，不带 sessionIgnored', () => {
-  assert.deepEqual(chooseModel({ pin: null, session: null }, STOCK), { ...FALLBACK_MODEL, source: 'fallback' })
+  assert.deepEqual(chooseModel({ pin: null, session: null }, EMPTY), { ...FALLBACK_MODEL, source: 'fallback' })
+  const noSession = chooseModel({ pin: null }, MIRRORED)
+  assert.deepEqual(noSession, { ...FALLBACK_MODEL, source: 'fallback' })
+  assert.ok(!('sessionIgnored' in noSession))
 })
 
-test('出厂 bili-duty + 钉了未知 provider ⇒ 照用，不悄悄换（失败由 diagnose 说清楚）', () => {
-  for (const session of [ses('deepseek-account'), ses('community-x'), null]) {
-    assert.deepEqual(chooseModel({ pin: pin('custom-gw', 'gw-model'), session }, STOCK),
-      { provider: 'custom-gw', model: 'gw-model', source: 'plugin' })
-  }
-})
-
-test('钉 DeepSeek ⇒ 哪个 profile 都照用', () => {
-  for (const env of [STOCK, EDITED, CUSTOM, HEADLESS]) {
-    assert.deepEqual(pick(chooseModel({ pin: pin('deepseek-official'), session: ses('custom-gw') }, env)), ['deepseek-official', 'plugin'])
-  }
-})
-
-test('钉 Antigravity 但这一轮不是 headless ⇒ 忽略并标出来：有能用的会话跟会话，没有就兜底', () => {
-  const ag = pin('google-antigravity')
-  const a = chooseModel({ pin: ag, session: ses('deepseek-account') }, STOCK)
-  assert.deepEqual(pick(a), ['deepseek-account', 'session'])
-  assert.deepEqual(a.ignored, ag)
-
-  const b = chooseModel({ pin: ag, session: ses('custom-gw', 'gw-model') }, STOCK)
-  assert.deepEqual(pick(b), ['deepseek-account', 'fallback'])
-  assert.deepEqual(b.ignored, ag)
-  assert.deepEqual(b.sessionIgnored, { provider: 'custom-gw', model: 'gw-model' })
-
-  // 自建 profile 上未知的会话 provider 是 maybe ⇒ 跟会话
-  const c = chooseModel({ pin: ag, session: ses('custom-gw') }, CUSTOM)
-  assert.deepEqual(pick(c), ['custom-gw', 'session'])
-  assert.deepEqual(c.ignored, ag)
-})
-
-test('钉 Antigravity 且这一轮就是 headless ⇒ 照用', () => {
-  assert.deepEqual(pick(chooseModel({ pin: pin('google-antigravity'), session: null }, HEADLESS)), ['google-antigravity', 'plugin'])
-})
-
-test('#175：自建 profile、改过 bundles 的模板和 headless ⇒ 未知 provider 钉了照用，没钉跟随会话', () => {
-  for (const env of [CUSTOM, EDITED, HEADLESS]) {
-    assert.deepEqual(pick(chooseModel({ pin: pin('custom-gw'), session: ses('deepseek-account') }, env)), ['custom-gw', 'plugin'])
-    assert.deepEqual(pick(chooseModel({ pin: null, session: ses('custom-gw') }, env)), ['custom-gw', 'session'])
-  }
-})
-
-test('providerState：未知 provider 只有在出厂 bili-duty 上才是 no', () => {
-  assert.equal(providerState('custom-gw', STOCK), 'no')
-  assert.equal(providerState('custom-gw', EDITED), 'maybe')
-  assert.equal(providerState('custom-gw', CUSTOM), 'maybe')
-  assert.equal(providerState('custom-gw', HEADLESS), 'maybe')
-  // 自建 profile 上 templateIsStock 不算数（比如自建 profile 恰好也只有两个 bundle，这一轮装没装还是看不到）
-  assert.equal(providerState('custom-gw', envOf('my-duty', true)), 'maybe')
-})
-
-test('providerState：白名单和绑定 profile 的规矩不变', () => {
-  assert.equal(providerState('', STOCK), 'no')
-  assert.equal(providerState(null, CUSTOM), 'no')
-  for (const env of [STOCK, EDITED, CUSTOM, HEADLESS]) {
-    assert.equal(providerState('deepseek-account', env), 'yes')
-    assert.equal(providerState('deepseek-official', env), 'yes')
-  }
-  assert.equal(providerState('google-antigravity', HEADLESS), 'yes')
-  assert.equal(providerState('google-antigravity', STOCK), 'no')
-  assert.equal(providerState('google-antigravity', CUSTOM), 'no')
-})
-
-test('providerState：判断 profile 或模板时抛错 ⇒ 未知 provider 算 maybe，不当成确定没有', () => {
-  const boom = () => { throw new Error('boom') }
-  assert.equal(providerState('custom-gw', { profile: boom, templateIsStock: () => true }), 'maybe')
-  assert.equal(providerState('custom-gw', { profile: () => 'bili-duty', templateIsStock: boom }), 'maybe')
-  assert.equal(providerState('google-antigravity', { profile: boom, templateIsStock: () => true }), 'no')
-})
-
-test('isStockTemplate：插件自带的模板就是出厂形状（改模板 bundles 时要同步 STOCK_BUNDLES）', () => {
-  const tpl = JSON.parse(readFileSync(new URL('../profile-template/bili-duty/package.json', import.meta.url), 'utf8'))
-  assert.equal(isStockTemplate(tpl), true)
-})
-
-test('isStockTemplate：加了 bundle、少了 bundle、读不到都不算出厂', () => {
-  const pkg = (bundles) => ({ dsh: { profile: { bundles } } })
-  assert.equal(isStockTemplate(pkg(['@deepseek-ai/dsh-headless', '@deepseek-ai/dsh-base'])), true)
-  assert.equal(isStockTemplate(pkg(['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-headless', 'some-provider-plugin'])), false)
-  assert.equal(isStockTemplate(pkg(['@deepseek-ai/dsh-base'])), false)
-  assert.equal(isStockTemplate(pkg(['@deepseek-ai/dsh-base', 'some-provider-plugin'])), false)
-  assert.equal(isStockTemplate(pkg('@deepseek-ai/dsh-base')), false)
-  assert.equal(isStockTemplate({}), false)
-  assert.equal(isStockTemplate(null), false)
+test('兜底那一对永远在可用集合里（账号登录的机器上也跑得起来）', () => {
+  assert.ok(BASE_PROVIDERS.includes(FALLBACK_MODEL.provider))
+  assert.deepEqual(availableProviders(EMPTY).slice(0, 2), BASE_PROVIDERS)
 })

@@ -32,7 +32,8 @@ import { verifyRecent, appendVerifyToReport } from './lib/verify.mjs'
 import { replaceSect } from './lib/report-sect.mjs'
 import { WINDOWS, stateDirOf, readJson, writeJson, ensureHomeFiles, ensureCharter, charterPath, inWindow, dayKey, seenDay } from './lib/state.mjs'
 import { diagnoseRound } from './lib/diagnose.mjs'
-import { BASE_PROVIDERS, PROFILE_ONLY_PROVIDERS, providerState as modelProviderState, isStockTemplate, chooseModel } from './lib/model-select.mjs'
+import { availableProviders, providerState as modelProviderState, chooseModel } from './lib/model-select.mjs'
+import { mirrorMainProfile, createMirrorCache } from './lib/provider-mirror.mjs'
 import { loginStart, loginPoll, saveCredential, renderQrPng } from './lib/login.mjs'
 import { resolveUid } from './lib/uid.mjs'
 import { loadCred as dmCred, listSessions as dmList, fetchMsgs as dmFetch } from './lib/dm.mjs'
@@ -858,9 +859,9 @@ function reportMeta() {
       + '例：`{"perDay":5,"peakValley":true,"noon":true,"night":true,"autoComment":false,"transcribe":false,"keywords":["DeepSeek Harness"]}`；'
       + '私信投递：`{"dmMode":"only","dmUid":12345678}`（dmMode = off / only / both）；'
       + '⭐ 指定这一轮用哪个模型：`{"modelProvider":"deepseek-account","modelName":"deepseek-flash"}`'
-      + '（两个都留空 = 跟随你当前会话选的模型；会话的 provider 在自带的 `bili-duty` profile 里没有时，那一轮改用 DeepSeek 兜底，并在 `status.model.sessionIgnored` 里标出来。'
-      + '⚠️ `bili-duty` 里确定有的只有 `deepseek-account` / `deepseek-official`。`google-antigravity` 只在 `headless` profile 里有，跑别的 profile 时填它会被忽略，并在 `status.model.ignored` 里标出来；'
-      + '填别的就照用、不换模型，那个 profile 里真没有驱动的话那一轮会直接失败（`NO_ADAPTER`），原因写进 `duty.log`）。',
+      + '（两个都留空 = 跟随你当前会话选的模型；会话的 provider 这一轮没有时，改用 DeepSeek 兜底，并在 `status.model.sessionIgnored` 里标出来。'
+      + '⭐ 这一轮能用哪些：DeepSeek 内置两条（`deepseek-account` / `deepseek-official`）+ 每轮从**主 profile** 的 `config.providers` 镜像过来的第三方 provider（按文件修改时间缓存，改了下一轮生效；密钥不复制）。'
+      + '填了就用、不悄悄换：那个 provider 这一轮真没有时，那一轮会直接失败（`NO_ADAPTER`），原因写进 `duty.log`，`status.modelMirror` 里有镜像的实情）。',
     parameters: { patch: { type: 'object', additionalProperties: true, description: '要改的字段（可省）' } },
     async execute(args) {
       let host = null
@@ -1409,39 +1410,92 @@ function reportMeta() {
    *    现在：
    *      · 设置页 / `bili_config` 里填了 `modelProvider` + `modelName` ⇒ **就用这一对**（source: plugin）
    *      · 没填（默认）⇒ 退回老行为，跟随当前会话（source: session）
-   *    两边都没有 ⇒ null（不写 agent-default-model，保持 DSH 自己的默认）。
+   *    两边都没有 ⇒ 兜底 DeepSeek（source: fallback）。
    *
-   *    🔴🔴 2026-10-23（本人实测 `NO_ADAPTER: no adapter registered for provider "google-antigravity"`）：
-   *    **不能拿桌面版能看到的所有 provider 当候选**。值班轮是 `dsh --profile headless` 起的，
-   *    而 headless profile 只装了 `@deepseek-ai/dsh-base` + `@deepseek-ai/dsh-headless`，
-   *    默认只有两条：`deepseek-official`（API key）和 `deepseek-account`（账号登录）。
-   *    桌面版的 Antigravity / Claude / Gemini 多半是**别的插件**在桌面 profile 里注册的，
-   *    headless 里没有这些适配器 ⇒ 选它那一轮在发第一个请求前就死，整轮白跑 ✗。
-   *    ⇒ 指定了用不了的 provider 时：**不写进 overlay**（这一轮退回跟随当前会话，至少能跑），
-   *      并在 `status` / 日志里把 `ignored` 带出来，让设置页明说"这个用不了"。
-   *
-   *    ⭐ 2026-10-23 实测：把 `dsh-tool-antigravity` 也装进 headless 后，
-   *    `google-antigravity / antigravity-gemini-3.8-flash` 在 `--profile headless` 里能正常出字
-   *    （它自带凭据读取，不要 webserver）⇒ 这一条加进白名单。**这份名单要和
-   *    `~/.dsh/profiles/headless/package.json` 里的 bundles 保持一致**，
-   *    以后 headless 里加了/删了 provider 插件，记得同步这里。
-   *
-   *    🔴🔴 2026-10-25（2.1.0 升级后）：2.1.0 起值班轮默认跑**最小权限的 `bili-duty` profile**
-   *    （只有 `dsh-base` + `dsh-headless` 两个 bundle）⇒ 那个 profile 里**只有 DeepSeek 两条路由**；
-   *    Antigravity 只装在老的 `headless` profile 里。所以白名单不能写死，要按**这一轮实际用的 profile** 判断，
-   *    否则钉着 Antigravity 的配置会直接 NO_ADAPTER、整轮白跑。
+   *    🔴🔴 2026-11-09（02-provider-mirror）：**白名单和「provider 绑定某个 profile」的规则一起删了**。
+   *    起因：2.1.0 起值班轮跑最小权限的 `bili-duty`（只有 dsh-base + dsh-headless），那里只有
+   *    DeepSeek 两条路由；使用者在自己主 profile 里配的第三方 provider 一个都看不见 ⇒ 钉了必
+   *    `NO_ADAPTER`，整轮白跑 ✗。硬编码名单还会**过时**：主 profile 装了新 provider、值班 profile
+   *    换了 bundles，插件都看不出来。
+   *    ⇒ 现在每轮把主 profile 的 `config.providers` **定义那一段**镜像进值班轮的 overlay
+   *      （`lib/provider-mirror.mjs`，按源文件 mtime 缓存，配置改了下一轮生效），
+   *      可用集合 = DeepSeek 内置两条 + **这一轮实际镜像出来的 provider**（装了什么就认什么）。
+   *    ⇒ 镜像失败 / 某个 provider 含内联密钥被拒：只少几个 provider，不报错、不影响这一轮；
+   *      原因写进 `duty.log`，并带进 `/status` 与 `/models` 供设置页显示。
    */
-  const modelEnv = {
-    profile: effectiveProfile,
-    // 读铺好的那份，不读插件里的模板：`dsh plugin --profile bili-duty add` 改的是这份，这一轮用的也是这份
-    templateIsStock: () => isStockTemplate(readJson(join(dutyProfileDir, 'package.json'), null)),
+  /** 主 profile 在哪、那份 provider 配置在哪（0.2.x 起宿主 provide 了 `profileContext`） */
+  const mainProfileInfo = () => {
+    try {
+      const pc = ctx.get('profileContext')
+      if (pc && pc.dir) {
+        const dir = String(pc.dir)
+        const files = []
+        for (const f of [pc.patchPath, join(dir, 'cordis.patch.yml'), join(dir, 'cordis.yml')]) {
+          if (f && !files.includes(String(f))) files.push(String(f))
+        }
+        return { name: String(pc.name || ''), dir, files }
+      }
+    } catch { /* 老宿主没有这个服务 —— 走下面的反推 */ }
+    // 退路：插件通常装在 <DSH_HOME>/profiles/<名>/node_modules/dsh-bili-scroll/
+    try {
+      const m = /[\\/]profiles[\\/]([^\\/]+)[\\/]/.exec(pluginDir)
+      if (m) {
+        const dir = join(pluginDir.slice(0, m.index), 'profiles', m[1])
+        return { name: m[1], dir, files: [join(dir, 'cordis.patch.yml'), join(dir, 'cordis.yml')] }
+      }
+    } catch { /* 反推不出来就不镜像 */ }
+    return null
   }
-  /** 三态和两条选择路径的规矩见 lib/model-select.mjs */
+  const MIRROR_EMPTY = { ok: true, key: 'no-profile', profile: '', from: '', files: [], entries: [], providers: [], rejected: [], notes: [], error: '' }
+  const mirrorCache = createMirrorCache()
+  let mirrorLoggedKey = null
+  /** 镜像结果变了才写日志（按 mtime 缓存，不刷屏） */
+  const logMirror = (r) => {
+    const where = r.profile ? `主 profile \`${r.profile}\`` : '主 profile'
+    if (!r.ok) {
+      log(`⚠️ 模型镜像：读不了${where}的 provider 配置（${r.error}）⇒ 这一轮只有 DeepSeek 两条`)
+      return
+    }
+    if (r.providers.length) {
+      log(`模型镜像：从 ${r.from} 抽到 ${r.providers.length} 个 provider（${r.providers.join(' / ')}）—— 密钥不复制，仍走 apiKeyEnv / 凭据库`)
+    } else if (!r.rejected.length) {
+      log(`模型镜像：${where}里没有 provider 定义（${r.from || '没找到配置文件'}）⇒ 这一轮只有 DeepSeek 两条`)
+    }
+    for (const x of r.rejected) {
+      log(`⚠️ 模型镜像：跳过 ${x.entryId ? x.entryId + ' / ' : ''}${x.provider} —— ${x.reason}`)
+    }
+  }
+  /** 这一轮从主 profile 镜像出来的 provider（结果按 mtime 缓存） */
+  const mirrorNow = () => {
+    const prof = mainProfileInfo()
+    if (!prof) return MIRROR_EMPTY
+    let r
+    try { r = mirrorMainProfile(prof.files, mirrorCache) }
+    catch (e) { r = { ...MIRROR_EMPTY, ok: false, error: String(e?.message ?? e) } }
+    r.profile = prof.name
+    if (r.key !== mirrorLoggedKey) {
+      mirrorLoggedKey = r.key
+      logMirror(r)
+    }
+    return r
+  }
+  const modelEnv = { available: () => mirrorNow().providers || [] }
+  /** 两条选择路径的规矩见 lib/model-select.mjs */
   const providerState = (p) => modelProviderState(p, modelEnv)
   const providerUsable = (p) => providerState(p) !== 'no'
-  const usableProviders = () => BASE_PROVIDERS.concat(
-    Object.keys(PROFILE_ONLY_PROVIDERS).filter((p) => providerUsable(p)),
-  )
+  const usableProviders = () => availableProviders(modelEnv)
+  /** 某个 provider 为什么用不了（给设置页 / `/models`；用得了返回空串） */
+  const providerWhy = (p) => {
+    const id = String(p || '').trim()
+    if (!id || providerUsable(id)) return ''
+    const m = mirrorNow()
+    const rej = (m.rejected || []).find((x) => x.provider === id)
+    if (rej) return `主 profile 里配了它，但含内联密钥、被拒绝镜像：${rej.reason}`
+    if (!m.ok) return `主 profile 的 provider 配置没读成：${m.error}`
+    if (!m.from) return '没找到主 profile 的配置文件（值班轮里没有这个 provider）'
+    if (!(m.entries || []).length) return `主 profile（${m.from}）里没配这个 provider`
+    return '主 profile 里配了别的 provider，但没有它'
+  }
   /** 设置页/工具里钉死的那一对（两个都填了才算） */
   const pinnedModel = () => {
     const provider = String(cfg.modelProvider || '').trim()
@@ -1484,6 +1538,23 @@ function reportMeta() {
     for (const id of ['credentials', 'authorization', 'deepseek-account']) {
       yml.push('- id: ' + id, '  disabled: false', '')
     }
+    // ⭐⭐ 2026-11-09（02-provider-mirror）：把主 profile 里配好的第三方 provider **只把定义那一段**
+    //    搬进这一轮的 overlay。值班 profile（dsh-base + dsh-headless）本来就有 `llm-pi-ai` 这条 entry
+    //    （只是没有 providers），所以给 `- id: llm-pi-ai` 补 `config.providers` 就够了 —— 不用把
+    //    整份 bundle 搬过去，也不用复制密钥（`apiKeyEnv` 引用照原样，凭据仍由 `~/.dsh/.credentials.yaml` 解析）。
+    //    ⚠️ DSH 的 patch 语义是「config 整体替换、不深合并」—— 我们只搬 providers，`llm-pi-ai` 的
+    //       Config 也只有 providers 一个键（dsh-llm-pi-ai 的 `z.object({ providers })`），所以正好。
+    //    ⚠️ 目标 entry 不在值班 profile 的组合配置里时，DSH 会警告并跳过这条 patch ——
+    //       插件这边看不到，但那一轮会以 NO_ADAPTER 结束，原因在 duty.log / 占位报告里。
+    try {
+      const mir = mirrorNow()
+      for (const e of mir.entries || []) {
+        if (!e.id || !e.block) continue
+        yml.push('- id: ' + e.id, '  config:')
+        for (const line of e.block.split('\n')) yml.push(line ? '    ' + line : '')
+        yml.push('')
+      }
+    } catch (e) { log('⚠️ 模型镜像：写进 overlay 失败：' + String(e?.message ?? e)) }
     // ⭐⭐ 2026-10-20（社区 PR #50 指出，DSH 0.2.1-rc.2 桌面版实测）：**光开那三个服务还不够** ——
     //    仍然会报 `MISSING_CREDENTIAL: llm-deepseek: no API key for provider route "deepseek-official"`，
     //    因为 headless 的 `agent-default-model` 默认解析到 `deepseek-official`（要 API key），
@@ -1494,14 +1565,15 @@ function reportMeta() {
     //    ⚠️ YAML 里这几个值一律加引号（用上面的 yq）—— 用户手填的 provider/model 带空格或冒号时不加引号会写坏整份 overlay
     try {
       const sel = chosenModel()
-      // ⭐ 当前会话是这一轮 profile 里没有的 provider，或者钉的绑定了别的 profile ⇒ 别带它（带了必 NO_ADAPTER），但要留一句明白话
+      // ⭐ 当前会话是这一轮 profile 里没有的 provider ⇒ 别带它（带了必 NO_ADAPTER），但要留一句明白话
       if (sel?.source === 'fallback') {
         log('⚠️ ' + (sel.sessionIgnored ? `当前会话的模型 ${sel.sessionIgnored.provider} / ${sel.sessionIgnored.model}` : '当前模型')
-          + ` 在 ${effectiveProfile()} 里没有适配器（那一轮只用得了 ${usableProviders().join(' / ')}）`
+          + ` 在 ${effectiveProfile()} 里没有适配器（这一轮只装得了 ${usableProviders().join(' / ')}）`
           + `⇒ 这一轮改用 ${sel.provider} / ${sel.model}`)
-      } else if (sel?.ignored) {
-        log(`⚠️ 设置里指定的模型 ${sel.ignored.provider} / ${sel.ignored.model} 在 ${effectiveProfile()} 里没有适配器`
-          + `（那一轮只用得了 ${usableProviders().join(' / ')}）⇒ 这一轮改为跟随当前会话：${sel.provider} / ${sel.model}`)
+      } else if (sel?.unavailable) {
+        // ⭐ 钉了就照用（不悄悄换）—— 但要说清它这一轮其实没有，别让人以为钉住了
+        log(`⚠️ 设置里指定的模型 ${sel.provider} / ${sel.model} 在 ${effectiveProfile()} 里没有适配器`
+          + `（原因：${providerWhy(sel.provider) || '主 profile 没配 / 没镜像成功'}）⇒ 仍按你钉的用，这一轮可能在第一个请求前就失败（NO_ADAPTER）`)
       }
       if (sel?.provider && sel?.model) {
         yml.push(
@@ -2763,22 +2835,38 @@ function reportMeta() {
    *      ② **给它一个上限时间**：`listModels` 有可能去敲网络，挂住的话设置页一直"读取中…" ✗；
    *      ③ **缓存 5 分钟**：设置页每 5 秒轮询一次 status，但模型列表只在打开时读一次，
    *         不缓存的话每次打开都重新问一遍，慢且浪费。
-   *    🔴 还有第 ④ 件（2026-10-23 本人踩出来的）：**只列 headless 里真用得上的 provider** ——
-   *       这个 `llm` 服务是**桌面 profile** 的，里面有订阅插件塞进来的 Antigravity / Claude / Gemini，
-   *       而值班轮跑在 headless profile（只有 `deepseek-official` / `deepseek-account` 两个适配器）。
-   *       把桌面那些也列出来 = 诱导用户选一个必然 `NO_ADAPTER` 的 ✗。
+   *    🔴 还有第 ④ 件（2026-11-09，02-provider-mirror 之后改的）：这个 `llm` 服务是**主 profile** 的，
+   *       里面有订阅插件塞进来的 Antigravity / Claude / Gemini；值班轮跑在最小权限 profile 上，
+   *       只有 DeepSeek 两条 + 本轮镜像过去的那些。⇒ **全都列出来，但每个都带 `usable` 与 `why`**：
+   *       能用的显示成可选，不能用的禁用并写明原因（主 profile 没配 / 含内联密钥被拒 / 配置没读成）——
+   *       只列能用的会让人以为"我配的 provider 不见了"，全列又不标原因会诱导人选一个必然 NO_ADAPTER 的 ✗。
    */
-  let modelCatalogCache = { at: 0, data: null }
+  let modelCatalogCache = { at: 0, key: null, data: null }
   const listModelCatalog = async () => {
     const now = Date.now()
-    if (modelCatalogCache.data && now - modelCatalogCache.at < 5 * 60_000) return modelCatalogCache.data
+    const mir = mirrorNow()
+    // ⭐ 配置一改（镜像的 mtime key 变了）⇒ 列表立刻重算，别让设置页 5 分钟里一直显示旧结果
+    if (modelCatalogCache.data && modelCatalogCache.key === mir.key && now - modelCatalogCache.at < 5 * 60_000) {
+      return modelCatalogCache.data
+    }
+    const mirSummary = {
+      ok: mir.ok,
+      profile: mir.profile,
+      from: mir.from,
+      providers: mir.providers || [],
+      rejected: mir.rejected || [],
+      error: mir.error || '',
+      notes: mir.notes || [],
+    }
     let providers = []
     try {
       const llm = ctx.get('llm')
-      /* ⭐ 2026-11-04：不再 filter 掉"不确定"的 —— 全都列出来，各带 usable 标记，让用户自己看见（出厂的 bili-duty 上没有"不确定"，只列 DeepSeek 两条） */
+      /* ⭐ 2026-11-09（02-provider-mirror）：**全都列出来，各带 usable 与原因** ——
+       *   'yes' = 这一轮确实有（DeepSeek 内置两条，或本轮从主 profile 镜像过来的 provider）；
+       *   'no'  = 主 profile 可能有、但这一轮没有；为什么没有写在 `why` 里，设置页直接显示 ✓ */
       const routes = (llm?.listProviders?.() || [])
-        .map((p) => ({ id: String(p?.id || ''), name: String(p?.name || p?.id || ''), state: providerState(p?.id) }))
-        .filter((p) => p.id && p.state !== 'no')
+        .map((p) => ({ id: String(p?.id || ''), name: String(p?.name || p?.id || '') }))
+        .filter((p) => p.id)
       // ⚠️ 并行问、每个都有 4 秒上限：串行问的话 provider 一多，设置页能等十几秒
       const ask = async (route) => {
         if (typeof llm?.listModels !== 'function') return null
@@ -2790,26 +2878,29 @@ function reportMeta() {
           ])
         } catch { models = [] }
         if (!Array.isArray(models) || !models.length) return null
+        const usable = providerUsable(route.id) ? 'yes' : 'no'
         return {
           id: route.id,
           name: route.name || route.id,
-          usable: route.state,
-          why: route.state === 'yes' ? '' : '这个只在你的主 profile 里装了；值班轮那个 profile 里有没有，插件看不到 —— 选了之后如果那一轮报「没有适配器」，说明要往值班 profile 里补一份 provider 定义',
+          usable,
+          why: usable === 'yes' ? '' : providerWhy(route.id),
           models: models.map((m) => ({ id: String(m.id), name: String(m.name || m.id) })),
         }
       }
       providers = (await Promise.all(routes.map(ask))).filter(Boolean)
     } catch { /* 老版本 / 没 llm 服务 ⇒ 空列表：界面只留「跟随当前会话」 */ }
-    // ⭐ 桌面版里那些用不上的 provider 单独报一下，设置页拿它来解释"为什么没有 Antigravity"
+    // 用不了、又因为列不出模型而没进 providers 的那些：单独报 id + 原因，设置页照样能说清楚
+    const shown = new Set(providers.map((p) => p.id))
     const unavailable = (() => {
       try {
         return (ctx.get('llm')?.listProviders?.() || [])
           .map((p) => String(p?.id || ''))
-          .filter((id) => id && !providerUsable(id))
+          .filter((id) => id && !shown.has(id) && !providerUsable(id))
+          .map((id) => ({ id, why: providerWhy(id) }))
       } catch { return [] }
     })()
-    const data = { providers, usable: usableProviders(), unavailable }
-    modelCatalogCache = { at: now, data }
+    const data = { providers, usable: usableProviders(), unavailable, mirror: mirSummary }
+    modelCatalogCache = { at: now, key: mir.key, data }
     return data
   }
 
@@ -2820,6 +2911,7 @@ function reportMeta() {
     const pickedTodayCount = countPickedToday()
     const manualExtraCount = Math.max(0, Number(st.manualExtra || 0))
     const today = dayKey()
+    const chosen = chosenModel()
     return {
       ok: true,
       home: stateDir,
@@ -2841,7 +2933,23 @@ function reportMeta() {
       venvReady: venvProbeNow().ready,
       version: myVersion(),
       // ⭐ 2026-10-23：这一轮会用的模型（设置页要把"到底用哪个"写出来，不然指定了也不知道生没生效）
-      model: chosenModel(),
+      model: chosen,
+      // ⭐ 2026-11-09：钉的那个这一轮没有时，原因是什么（'' = 用得了）
+      modelWhy: chosen?.unavailable ? providerWhy(chosen.provider) : '',
+      // ⭐ 2026-11-09（02-provider-mirror）：模型镜像的实情 —— 设置页要能说清
+      //    "主 profile 配了、但没镜像过来 / 含内联密钥被拒"，而不是只看见一个必然 NO_ADAPTER 的选项
+      modelMirror: (() => {
+        const m = mirrorNow()
+        return {
+          ok: m.ok,
+          profile: m.profile,
+          from: m.from,
+          providers: m.providers || [],
+          rejected: m.rejected || [],
+          error: m.error || '',
+          notes: m.notes || [],
+        }
+      })(),
       // ⭐ 2026-10-23：现在有没有一轮在跑（设置页据此把「现在跑一轮」置灰 + 显示已经跑了多久）
       running: Boolean(dutyChild),
       runningSince: dutyStartedAt || 0,

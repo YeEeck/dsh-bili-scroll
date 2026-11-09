@@ -281,7 +281,7 @@ function WatchTab() {
       const [kws, setKws] = React.useState(null)
       const [favFolders, setFavFolders] = React.useState(null)   // 收藏夹列表（下拉用，null = 还没读）
       const [favId, setFavId] = React.useState(null)             // 选中的收藏夹 fid（字符串）
-      const [modelList, setModelList] = React.useState(null)     // 可选模型（null = 还没读；[] = 读到了但没有）
+      const [modelList, setModelList] = React.useState(null)     // /models 的返回（null = 还没读）
       const [wsList, setWsList] = React.useState(null)           // DSH 里已建好的工作区（下拉用，null = 还没读）
       const [persona, setPersona] = React.useState(null)   // 人设提示词草稿
       const [excl, setExcl] = React.useState(null)              // 排除词草稿（一行一个）
@@ -357,10 +357,12 @@ function WatchTab() {
       }, [favFolders])
 
       // ⭐ 2026-10-23：可选模型列表（宿主从 llm 服务里问出来）—— 同样只读一次
+      // ⭐ 2026-11-09（02-provider-mirror）：存整份返回 —— 除了 providers，还要用 unavailable / mirror 说清原因
       React.useEffect(() => {
         if (modelList !== null) return
-        jget('/models').then((r) => { if (alive.current) setModelList(r && r.ok ? (r.providers || []) : []) })
-          .catch(() => { if (alive.current) setModelList([]) })
+        jget('/models').then((r) => {
+          if (alive.current) setModelList(r && r.ok ? r : { providers: [], unavailable: [], mirror: null })
+        }).catch(() => { if (alive.current) setModelList({ providers: [], unavailable: [], mirror: null }) })
       }, [modelList])
 
       // ⭐ 2026-11-04：已建好的工作区列表（宿主查 workspaceRegistry）—— 只读一次
@@ -620,15 +622,16 @@ function WatchTab() {
       const sw = (k) => Boolean(k in optim ? optim[k] : cfg[k])
 
       /* ⭐ 2026-10-23：模型下拉 —— 值用 `provider|model` 拼成一个字符串，
-       *    这样「跟随当前会话」（空值）和"钉死某一个"用同一个 select 就能表达。
-       *    ⚠️ 前端也再筛一遍：万一接的是旧版宿主（/models 还是把所有 provider 都吐出来），
-       *       至少下拉里不会出现必然 NO_ADAPTER 的那些。 */
-      /* ⭐ 2026-11-04（#175）：不再按写死的名单筛 —— 后端已经给每个 provider 带了 usable，全都列出来；
-       *    'yes' 是白名单里的（值班轮一定有），'maybe' 是宿主有、但值班那个 profile 装没装看不到。
-       *    出厂的 bili-duty 上后端不给 'maybe'，只有自建 profile 或改过 bundles 的模板才有。 */
-      const usableList = (modelList || [])
+       *    这样「跟随当前会话」（空值）和"钉死某一个"用同一个 select 就能表达。 */
+      /* ⭐⭐ 2026-11-09（02-provider-mirror）：白名单没了 —— 后端按「这一轮实际装了什么」算好：
+       *    DeepSeek 内置两条 + 每轮从主 profile 镜像进值班轮 overlay 的 provider。
+       *    usable = 'yes' 是真能用；'no' 是宿主有、但这一轮没有，`why` 里写了原因
+       *    （主 profile 没配 / 含内联密钥被拒 / 配置没读成）—— 照样列出来，只是禁用选项 + 把原因写在标题上。 */
+      const usableList = (modelList && modelList.providers) || []
+      const mirror = st.modelMirror || (modelList && modelList.mirror) || null
+      const hasUsable = usableList.some((p) => p.usable === 'yes')
       const modelOptions = []
-      for (const p of usableList) for (const m of (p.models || [])) modelOptions.push(p.id + '|' + m.id)
+      for (const p of usableList) if (p.usable === 'yes') for (const m of (p.models || [])) modelOptions.push(p.id + '|' + m.id)
       const modelValue = (cfg.modelProvider && cfg.modelName) ? String(cfg.modelProvider) + '|' + String(cfg.modelName) : ''
       /* ⭐ 2026-11-04：工作区下拉的当前值 —— 配置里存的可能是带斜杠/反斜杠的路径，和注册表里的写法不一定一样 */
       const normWs = (x) => { let v = String(x || '').split(String.fromCharCode(92)).join('/'); while (v.endsWith('/')) v = v.slice(0, -1); return v.toLowerCase() }
@@ -638,11 +641,10 @@ function WatchTab() {
         return hit ? hit.path : cur
       })()
       /* ⭐ 分组标题上写清楚这条路怎么用：deepseek-official 要 API key，账号登录的机器选它跑不起来 */
-      const PROVIDER_HINT = { 'deepseek-account': ' · 账号登录', 'deepseek-official': ' · 需要 API key', 'google-antigravity': ' · Antigravity 订阅' }
-      const UNCERTAIN_TAG = ' · 不确定值班轮有没有'
+      const PROVIDER_HINT = { 'deepseek-account': ' · 账号登录', 'deepseek-official': ' · 需要 API key' }
       const providerLabel = (p) => {
         const base = (p.name || p.id) + (PROVIDER_HINT[p.id] || '')
-        return p.usable === 'maybe' ? base + UNCERTAIN_TAG : base
+        return p.usable === 'yes' ? base : base + ' · 不可用' + (p.why ? '：' + p.why : '')
       }
       const pickModel = (v) => {
         if (!v) { patch({ modelProvider: '', modelName: '' }, '模型'); return }
@@ -726,32 +728,43 @@ function WatchTab() {
             (modelValue && modelOptions.indexOf(modelValue) < 0)
               ? h('option', { value: modelValue }, modelValue.replace('|', ' / ') + '（当前设置）') : null,
             ...usableList.map((p) => h('optgroup', { key: p.id, label: providerLabel(p) },
-              (p.models || []).map((m) => h('option', { key: p.id + '|' + m.id, value: p.id + '|' + m.id },
-                (m.name && m.name !== m.id) ? m.name + '（' + m.id + '）' : m.id))))),
+              (p.models || []).map((m) => h('option', {
+                key: p.id + '|' + m.id, value: p.id + '|' + m.id,
+                disabled: p.usable === 'yes' ? undefined : true,   // ⭐ 不可用的只展示原因，别让人选进去白跑一轮
+              }, (m.name && m.name !== m.id) ? m.name + '（' + m.id + '）' : m.id))))),
           h('div', { 'data-bd-note': '' },
             '它每轮是另起一个 headless 会话跑的 —— 默认用你在会话里选的那个模型；'
             + '想让它固定用某个（比如更省 / 更强），就在这里选。改完下一轮生效，不用重启。'),
           h('div', { 'data-bd-note': '' },
-            '⚠️ 值班轮跑在另一个 profile（默认 `bili-duty`），和你的主 profile 不一定一样。自带的 `bili-duty` 只有 DeepSeek 两条，这里也就只列这两条；'
-            + '换成自建 profile，或者改过模板的 bundles，主 profile 里的其他 provider 才会列出来并标「不确定」。'
-            + '钉了这种 provider 不会被悄悄换掉：值班 profile 里真没有驱动的话，那一轮会直接失败（NO_ADAPTER），原因写进 duty.log，当天还没有日报时也会写进占位报告。'),
-          st.model && st.model.ignored ? h('div', { 'data-bd-msg': '', 'data-warn': '' },
-            '你指定的 ' + st.model.ignored.provider + ' / ' + st.model.ignored.model
-            + ' 刷B站这一轮用不了（值班那个 profile 里没有这个适配器）⇒ 已自动改回'
-            + (st.model.source === 'session' ? '跟随当前会话：' + st.model.provider + ' / ' + st.model.model
-              : ' DeepSeek 兜底：' + st.model.provider + ' / ' + st.model.model)
-            + '。换一个上面列表里的，或把「跟随当前会话」留空。') : null,
+            '值班轮跑在另一个 profile（默认 `bili-duty`），但每轮会把**你正在用的主 profile**'
+            + (mirror && mirror.profile ? '（`' + mirror.profile + '`）' : '')
+            + '里配好的 provider 定义镜像过去 ⇒ 上面列的就是这一轮真能用的：DeepSeek 两条 + 你自己配的第三方 provider。'
+            + '镜像只搬 `config.providers` 那一段、密钥不复制（仍走 apiKeyEnv / 凭据库）；主 profile 的配置改了，下一轮自动生效。'),
+          mirror && mirror.rejected && mirror.rejected.length
+            ? h('div', { 'data-bd-msg': '', 'data-warn': '' },
+              '主 profile 里有 ' + mirror.rejected.length + ' 个 provider 没镜像过来（含内联密钥）：'
+              + mirror.rejected.map((x) => x.provider + '（' + x.key + '）').join('、')
+              + '。改成 apiKeyEnv 引用环境变量后，下一轮就会带上。') : null,
+          mirror && mirror.ok === false
+            ? h('div', { 'data-bd-msg': '', 'data-warn': '' },
+              '没读到主 profile 的 provider 配置：' + (mirror.error || '原因未知')
+              + ' ⇒ 这一轮只有 DeepSeek 两条（原因也写进 duty.log 了）。') : null,
+          st.model && st.model.unavailable ? h('div', { 'data-bd-msg': '', 'data-warn': '' },
+            '你指定的 ' + st.model.provider + ' / ' + st.model.model + ' 这一轮用不了'
+            + (st.modelWhy ? '：' + st.modelWhy : '。')
+            + '钉了就照用、不悄悄换 ⇒ 这一轮很可能在第一个请求前就失败（NO_ADAPTER），原因写进 duty.log。'
+            + '换一个上面列出的可用模型，或留空跟随当前会话。') : null,
           st.model && st.model.source === 'fallback' ? h('div', { 'data-bd-msg': '', 'data-warn': '' },
             '你当前会话用的模型'
             + (st.model.sessionIgnored ? ' ' + st.model.sessionIgnored.provider + ' / ' + st.model.sessionIgnored.model : '')
-            + ' 刷B站这一轮用不了（值班那个 profile 里没有这个适配器）⇒ 这一轮会改用 '
+            + ' 这一轮用不了（主 profile 里没配、或没镜像过来）⇒ 这一轮会改用 '
             + st.model.provider + ' / ' + st.model.model + ' 跑，不会白跑。'
             + '想固定它的话，在上面选一个。') : null,
           modelList === null ? h('div', { 'data-bd-note': '' }, '模型列表读取中…') : null,
-          (modelList && usableList.length === 0)
+          (modelList && !hasUsable)
             ? h('div', { 'data-bd-note': '' }, '没读到可用的模型 —— 宿主里没列出 deepseek-account / deepseek-official。仍然可以「跟随当前会话」。') : null,
-          (modelList && usableList.length === 0) ? h('div', { 'data-bd-sub': '' },
-            h('div', { 'data-bd-note': '' }, '也可以直接手填（只认这一轮 profile 里装了的：deepseek-account / deepseek-official；两个都填才生效，留空 = 跟随当前会话）：'),
+          (modelList && !hasUsable) ? h('div', { 'data-bd-sub': '' },
+            h('div', { 'data-bd-note': '' }, '也可以直接手填（这一轮真装了的才会生效：DeepSeek 两条 + 主 profile 镜像过来的 provider；两个都填才生效，留空 = 跟随当前会话）：'),
             h('div', { 'data-bd-row': '' },
               h('input', {
                 'data-bd-input': '', placeholder: 'provider（如 deepseek-account）', value: mProv ?? '',
@@ -763,9 +776,12 @@ function WatchTab() {
                 onChange: (e) => setMName(e.target.value),
                 onBlur: () => patch({ modelProvider: String(mProv || '').trim(), modelName: String(mName || '').trim() }, '模型'),
               }))) : null,
+          (modelList && modelList.unavailable && modelList.unavailable.length) ? h('div', { 'data-bd-note': '' },
+            '这些 provider 这一轮用不了：'
+            + modelList.unavailable.map((u) => u.id + '（' + (u.why || '主 profile 没配') + '）').join('；')) : null,
           st.model ? h('div', { 'data-bd-note': '' },
             '下一轮会用：' + st.model.provider + ' / ' + st.model.model
-            + (st.model.source === 'plugin' ? '（这里指定的）'
+            + (st.model.source === 'plugin' ? (st.model.unavailable ? '（这里指定的；⚠️ 这一轮没有它）' : '（这里指定的）')
               : st.model.source === 'fallback' ? '（兜底，见上面的提示）'
                 : '（跟随当前会话）')) : null),
 
