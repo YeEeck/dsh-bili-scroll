@@ -37,6 +37,9 @@ import { mirrorMainProfile, createMirrorCache } from './lib/provider-mirror.mjs'
 import { BRIEF_LIMIT, GATE_MAX, clampBrief, clampGateCount, gateOf, tastePromptOf, parseGateBlocked } from './lib/taste.mjs'
 import { personaForPrompt } from './lib/persona.mjs'
 import { checkOutboundText } from './lib/outbound.mjs'
+import { appendDelivery, readDelivery, summarizeDelivery } from './lib/ledger.mjs'
+import { createFileLock } from './lib/file-lock.mjs'
+import { createPrivateSender } from './lib/send.mjs'
 import { loginStart, loginPoll, saveCredential, renderQrPng } from './lib/login.mjs'
 import { resolveUid } from './lib/uid.mjs'
 import { loadCred as dmCred, listSessions as dmList, fetchMsgs as dmFetch } from './lib/dm.mjs'
@@ -662,6 +665,38 @@ function reportMeta() {
   }
 
   const hasCredential = () => existsSync(join(stateDir, 'bili_credential.json'))
+
+  /* ─────────────── 投递账 + 宿主发送通道（工单 05） ───────────────
+   * 发送权归宿主：这里不是模型工具，只给 /api/bili-duty/deliver 与后续 07/09 用。
+   * 每次尝试都落一条账（`stateDir/delivery-ledger.jsonl`）；跨宿主用 delivery-lock.json 互斥。
+   */
+  const deliveryLock = createFileLock({
+    file: join(stateDir, 'delivery-lock.json'),
+    ttlMs: 3 * 60_000,           // 一次发送超时 60 秒，3 分钟足够兜住崩溃的宿主
+    log,
+  })
+  const sendPrivate = createPrivateSender({
+    // bili_send_message 的入参是 receiver_uid / text（见 vendor/bilibili-mcp/mcp_server.py）
+    send: (args) => call('bili_send_message', args, { timeoutMs: 60_000 }),
+    append: (record) => appendDelivery(stateDir, record),
+    lock: deliveryLock,
+    log,
+  })
+  /** `/status` 要的两个最少字段：今天已投递几条（口径同 delivery-policy）、最近一次尝试 */
+  const deliveryState = () => {
+    const s = summarizeDelivery(readDelivery(stateDir), { day: dayKey() })
+    const l = s.lastDelivery
+    return {
+      deliveredToday: s.deliveredToday,
+      lastDelivery: l ? {
+        at: String(l.at ?? ''),
+        status: String(l.status ?? ''),
+        bvid: String(l.bvid ?? ''),
+        msgKey: String(l.msgKey ?? ''),
+        manual: l.manual === true,
+      } : null,
+    }
+  }
 
   /* ─────────────── 工具 ─────────────── */
 
@@ -3018,6 +3053,9 @@ function reportMeta() {
       autoLeft: Math.max(0, Number(cfg.perDay || 0) - (pickedTodayCount - manualExtraCount)),
       // ⭐ 2026-11 工单 03：今天硬门槛挡掉了多少条（从当天日报那行读；关着 / 没这行 = 0）
       gateBlocked: gateBlockedToday(),
+      // ⭐ 2026-11 工单 05：投递账的两个最少状态 —— 设置页与 07/09 都读它
+      //    deliveredToday 只数「有回执且非 manual」的（口径同 lib/delivery-policy.mjs）
+      ...deliveryState(),
       lastManualAt: st.lastManualAt || null,
       lastRunAt: st.lastRunAt || null,
       lastWhy: st.lastWhy || null,
@@ -3213,6 +3251,25 @@ function reportMeta() {
     if (req.method === 'POST' && path === '/api/bili-duty/run') {
       if (cfg.dmMode !== 'off' && !(Number(cfg.dmUid) > 0)) await warmDmUid()
       return sendJson(res, 200, { ok: true, ...runDuty('manual') })
+    }
+
+    // ⭐ 2026-11 工单 05：宿主发送一条纯文本私信（**不是模型工具**，模型没有发送权）
+    //    body: { uid, text, bvid, manual }；uid 缺省用设置里的「私信发给谁」。
+    //    返回值带账本那条记录（07/09 据此判断 sent / no-receipt / failed / error / busy）。
+    if (req.method === 'POST' && path === '/api/bili-duty/deliver') {
+      const body = await readBody(req)
+      const uid = Number(body.uid) > 0 ? Number(body.uid) : Number(cfg.dmUid) || 0
+      const manual = body.manual === true || body.manual === 'true'
+      const result = await sendPrivate({
+        receiverUid: uid,
+        text: String(body.text ?? ''),
+        bvid: String(body.bvid ?? ''),
+        manual,
+      })
+      log('投递请求：uid=' + uid + ' bvid=' + (result?.record?.bvid || '-')
+        + ' manual=' + manual
+        + ' ⇒ ' + (result?.busy ? 'busy' : result?.status || '?'))
+      return sendJson(res, 200, result)
     }
 
     // 建 venv + 装依赖（**不等它**：几分钟的活，进度写 install.log）

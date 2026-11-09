@@ -1,0 +1,86 @@
+// test/fixtures/fake-bili-mcp.txt
+// 给 test/delivery-send.test.mjs 用的假 MCP stdio 服务：一行一个 JSON-RPC，只认
+// initialize / notifications/initialized / tools/call。由测试覆盖到 <stateDir>/mcp_server.py，
+// 再把 config.json 的 pythonPath 指向 process.execPath，于是走的是真的 McpClient。
+//
+// 场景从 cwd（= stateDir，McpClient 的 cwd）里的 fake-mcp-mode.txt 读：
+//   ok         → 成功，回执在 data.msg_key（故意慢 100ms，用来观测并发）
+//   no-receipt → success:true 但没有 msg_key
+//   reject     → success:false + data.code=21007
+//   exit       → 直接退出（模拟工具不可用 / 崩溃）
+// 每次 tools/call 都记进 fake-mcp-stats.json（calls / active / maxActive），
+// 测试据此断言同一进程内的两条发送没有同时进 MCP。
+// ⚠️ 这个文件会被拷成 <stateDir>/mcp_server.py 再交给 node 跑；根 package.json 是 type:module，
+// 但家目录没有 package.json，Node 会把无扩展名认识的 `.py` 当 CommonJS ⇒ 这里必须用 require，
+// 不能用 import（ESM 的 .py 入口会报 ERR_UNKNOWN_FILE_EXTENSION）。
+const { readFileSync, writeFileSync } = require('node:fs')
+const { join } = require('node:path')
+const readline = require('node:readline')
+
+const dir = process.cwd()
+const modeFile = join(dir, 'fake-mcp-mode.txt')
+const statsFile = join(dir, 'fake-mcp-stats.json')
+
+const readMode = () => {
+  try { return readFileSync(modeFile, 'utf8').trim() || 'ok' } catch { return 'ok' }
+}
+const readStats = () => {
+  try {
+    const j = JSON.parse(readFileSync(statsFile, 'utf8'))
+    return j && typeof j === 'object' ? j : { calls: 0, active: 0, maxActive: 0 }
+  } catch { return { calls: 0, active: 0, maxActive: 0 } }
+}
+const writeStats = (s) => writeFileSync(statsFile, JSON.stringify(s))
+const reply = (id, result) => process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id, result }) + '\n')
+
+readline.createInterface({ input: process.stdin }).on('line', (line) => {
+  let msg
+  try { msg = JSON.parse(line) } catch { return }
+
+  if (msg.method === 'initialize') {
+    reply(msg.id, { protocolVersion: '2024-11-05', capabilities: {}, serverInfo: { name: 'fake-bili-mcp', version: '0.0.0' } })
+    return
+  }
+  if (msg.method === 'notifications/initialized') return
+
+  if (msg.method !== 'tools/call') {
+    if (msg.id !== undefined) reply(msg.id, {})
+    return
+  }
+
+  const stats = readStats()
+  stats.calls = (stats.calls || 0) + 1
+  stats.active = (stats.active || 0) + 1
+  stats.maxActive = Math.max(stats.maxActive || 0, stats.active)
+  writeStats(stats)
+
+  const mode = readMode()
+  if (mode === 'exit') process.exit(1)
+
+  const text = mode === 'reject'
+    ? JSON.stringify({
+      success: false,
+      error: '接口拒绝（code=21007）：对方设置了不接收陌生人私信',
+      data: { code: 21007, message: '对方设置了不接收陌生人私信' },
+    })
+    : mode === 'no-receipt'
+      ? JSON.stringify({
+        success: true,
+        message: '接口回了成功，但没有投递回执（msg_key）',
+        data: { code: 0 },
+      })
+      : JSON.stringify({
+        success: true,
+        message: '私信已投递',
+        data: { code: 0, msg_key: 'fake-msg-key-' + stats.calls },
+      })
+
+  const finish = () => {
+    // 重新读一次再减：另一个请求可能已经改过 active
+    const s = readStats()
+    s.active = Math.max(0, (s.active || 1) - 1)
+    writeStats(s)
+    reply(msg.id, { content: [{ type: 'text', text }] })
+  }
+  setTimeout(finish, mode === 'ok' ? 100 : 0)
+})
