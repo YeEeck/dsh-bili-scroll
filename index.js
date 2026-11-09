@@ -34,6 +34,7 @@ import { WINDOWS, stateDirOf, readJson, writeJson, ensureHomeFiles, ensureCharte
 import { diagnoseRound } from './lib/diagnose.mjs'
 import { availableProviders, providerState as modelProviderState, chooseModel } from './lib/model-select.mjs'
 import { mirrorMainProfile, createMirrorCache } from './lib/provider-mirror.mjs'
+import { BRIEF_LIMIT, GATE_MAX, clampBrief, clampGateCount, gateOf, tastePromptOf, parseGateBlocked } from './lib/taste.mjs'
 import { loginStart, loginPoll, saveCredential, renderQrPng } from './lib/login.mjs'
 import { resolveUid } from './lib/uid.mjs'
 import { loadCred as dmCred, listSessions as dmList, fetchMsgs as dmFetch } from './lib/dm.mjs'
@@ -78,6 +79,17 @@ export const Config = !z ? undefined : z.object({
   mentionName: z.string().default('').extra('volatile', true),
   /** 关注关键词（空了用章程里默认那几组） */
   keywords: z.array(z.string()).default([]).extra('volatile', true),
+  /** ⭐ 口味简报：一段自然语言「想让它找什么」—— 采集轮据此决定走推荐流还是自己提炼搜索词，并按它筛。
+   *  留空 = 退回老办法（有关键词就搜关键词、没有就刷推荐流）；**有效上限 4000 字，口径见 clampPatch** */
+  tasteBrief: z.string().default('').extra('volatile', true),
+  /** ⭐ 数值硬门槛总开关（默认关 —— 关着时行为与以前完全一样：不写、不解析） */
+  gateEnabled: z.boolean().default(false).extra('volatile', true),
+  /** 硬门槛：最低播放量（0 = 不限）· 有效范围 0–10000000，口径见 clampPatch */
+  gateMinViews: z.number().default(0).extra('volatile', true),
+  /** 硬门槛：最短时长（分钟，0 = 不限）· 有效范围 0–600 */
+  gateMinMinutes: z.number().default(0).extra('volatile', true),
+  /** 硬门槛：只看最近几天发布的（0 = 不限）· 有效范围 0–365 */
+  gateWithinDays: z.number().default(0).extra('volatile', true),
   /** Python：指向 venv 里的那个最好 */
   pythonPath: z.string().default('python').extra('volatile', true),
   /** dsh 的 bin.js（不填就试自动探测，再退化成 shell 里的 dsh） */
@@ -278,6 +290,8 @@ function reportMeta() {
     // ⭐ 2.3.0：手动轮 / 抓取量 / 排除词 / 评论长度 —— 少一项 normalize 就会把用户存的值丢掉
     manualMax: 3, manualCooldownMin: 3, searchSort: 'pubdate', searchPages: 2, fetchPerRound: 8, excludeWords: [], commentLength: 'medium',
     modelProvider: '', modelName: '', runTimeoutMinutes: 20,
+    // ⭐ 2026-11 工单 03（口味简报 / 可选硬门槛）：默认全空 / 全关 —— 老用户升级上来行为不变
+    tasteBrief: '', gateEnabled: false, gateMinViews: 0, gateMinMinutes: 0, gateWithinDays: 0,
   }
   const normalize = (src, base) => {
     const out = { ...base }
@@ -304,6 +318,8 @@ function reportMeta() {
    *      commentPerRound 两条路径都没钳，直接 POST 能写 9999）
    *    （2026-10-17 复查补：DSH 原生设置页那条路我们钳不到**写** —— 用户能在那儿直接填 9999 ⇒
    *      loadCfg 读回来也过一遍，写进去和读出来一个口径） */
+  // ⚠️ 简报超上限只提醒一次（loadCfg 每次都过 clampPatch；每 5 秒轮询都刷一行日志就成噪音了）
+  let briefTruncLogged = false
   const clampPatch = (patch) => {
     const p = { ...patch }
     if ('perDay' in p) p.perDay = Math.max(0, Math.min(Number(p.perDay) || 0, 50))
@@ -330,6 +346,21 @@ function reportMeta() {
     if ('modelProvider' in p) p.modelProvider = String(p.modelProvider || '').trim().slice(0, 120)
     if ('modelName' in p) p.modelName = String(p.modelName || '').trim().slice(0, 160)
     if ('runTimeoutMinutes' in p) p.runTimeoutMinutes = Math.max(1, Math.min(Number(p.runTimeoutMinutes) || 20, 120))
+    // ⭐ 2026-11 工单 03（口味简报 / 硬门槛）：写与读两头都钳 ——
+    //    简报超 4000 字截断（只提醒一次）；三条门槛钳成「非负整数、0 = 不限、有上限」。
+    //    ⚠️ 上限就是 lib/taste.mjs 里那份 GATE_MAX —— 设置页也跟着它写，别再抄一遍数字。
+    if ('tasteBrief' in p) {
+      const raw = String(p.tasteBrief ?? '')
+      p.tasteBrief = clampBrief(raw)
+      if (raw.trim().length > p.tasteBrief.length && !briefTruncLogged) {
+        briefTruncLogged = true
+        log('⚠️ 口味简报 ' + raw.trim().length + ' 字，超过保存上限 ' + BRIEF_LIMIT + ' ⇒ 只存前 ' + BRIEF_LIMIT + ' 字')
+      }
+    }
+    if ('gateEnabled' in p) p.gateEnabled = Boolean(p.gateEnabled)
+    if ('gateMinViews' in p) p.gateMinViews = clampGateCount(p.gateMinViews, GATE_MAX.minViews)
+    if ('gateMinMinutes' in p) p.gateMinMinutes = clampGateCount(p.gateMinMinutes, GATE_MAX.minMinutes)
+    if ('gateWithinDays' in p) p.gateWithinDays = clampGateCount(p.gateWithinDays, GATE_MAX.withinDays)
     return p
   }
 
@@ -785,6 +816,8 @@ function reportMeta() {
         today: dayKey(now),
         ranToday: st.day === dayKey(now) ? Number(st.count || 0) : 0,
         pickedToday: countPickedToday(now),
+        // ⭐ 2026-11 工单 03：今天硬门槛挡掉了多少条（没开 / 日报里没那行 = 0）
+        gateBlocked: gateBlockedToday(now),
         perDay: cfg.perDay,
         // ⭐ 2026-10-19：这一轮会用哪个 dsh（空 = 没找到 ⇒ 那一轮根本跑不起来）
         dshCli: dshCliCached(),
@@ -858,6 +891,8 @@ function reportMeta() {
     description: '读 / 改「刷B站」的设置。不给 `patch` 就是读；给了就改（只认 schema 里的字段）。\n'
       + '例：`{"perDay":5,"peakValley":true,"noon":true,"night":true,"autoComment":false,"transcribe":false,"keywords":["DeepSeek Harness"]}`；'
       + '私信投递：`{"dmMode":"only","dmUid":12345678}`（dmMode = off / only / both）；'
+      + '口味：`{"tasteBrief":"我想看真正上手 DSH 的实操，少看发布会","gateEnabled":true,"gateMinViews":50000,"gateMinMinutes":8,"gateWithinDays":7}`'
+      + '（简报是一段话，留空 = 退回老办法；三条门槛 0 = 不限，开关默认关）；'
       + '⭐ 指定这一轮用哪个模型：`{"modelProvider":"deepseek-account","modelName":"deepseek-flash"}`'
       + '（两个都留空 = 跟随你当前会话选的模型；会话的 provider 这一轮没有时，改用 DeepSeek 兜底，并在 `status.model.sessionIgnored` 里标出来。'
       + '⭐ 这一轮能用哪些：DeepSeek 内置两条（`deepseek-account` / `deepseek-official`）+ 每轮从**主 profile** 的 `config.providers` 镜像过来的第三方 provider（按文件修改时间缓存，改了下一轮生效；密钥不复制）。'
@@ -919,6 +954,18 @@ function reportMeta() {
       }
     } catch { /* 读不到就按 0 算 */ }
     return Math.max(fromState, countPicks(reportFileOf(now)), fromSeen)
+  }
+  // ⭐ 2026-11 工单 03：硬门槛挡掉的条数 —— **从今天的日报里读**（那一轮自己写的账，和配额同源）。
+  //   · 门槛关着 ⇒ 不读、恒 0（关闭时不写也不解析，行为与以前一样）
+  //   · 开着但日报里没有那一行（那一轮没写 / 老报告）⇒ 0；解析容错，**绝不让 /status 因此报错**
+  //   · 一天可能跑两轮 ⇒ 求和（每轮各写一行）；解析口径在 lib/taste.mjs 的 parseGateBlocked
+  const gateBlockedToday = (now = new Date()) => {
+    try {
+      if (!gateOf(cfg).active) return 0
+      const f = reportFileOf(now)
+      if (!existsSync(f)) return 0
+      return parseGateBlocked(readFileSync(f, 'utf8'))
+    } catch { return 0 }
   }
   // ⭐ 2.3.0：手动轮是「额外的一次」—— 自动额度只扣自动轮挑的（manualExtra 是手动轮多挑的那部分）
   const autoPickedToday = (now = new Date()) => {
@@ -1152,6 +1199,15 @@ function reportMeta() {
       charterText = readFileSync(duty, 'utf8').split('<家目录>').join(stateDir)
     } catch { /* 读不到就退回"让它自己读路径"（下面提示词里会说） */ }
     const kws = Array.isArray(cfg.keywords) ? cfg.keywords.filter(Boolean) : []
+    // ⭐ 2026-11 工单 03（口味简报 / 硬门槛）：**这一轮"看哪儿"**整段由 lib/taste.mjs 拼（纯函数、有测试）。
+    //    简报为空时它输出的两句话与升级前**一字不差**（老用户零回归）；简报非空时那份简报是主依据，
+    //    老关键词降成「你可能想搜这些」。硬门槛是另一维：开着才追加那段，并要那一轮在日报里写「硬门槛挡掉 N 条」。
+    const taste = tastePromptOf({
+      brief: cfg.tasteBrief,
+      keywords: kws,
+      gate: gateOf(cfg),
+      search: { sort: cfg.searchSort, pages: cfg.searchPages, fetchPerRound: cfg.fetchPerRound },
+    })
     // ⭐ 开场先让它读**工作区**的 AGENTS.md —— 这一轮的工作目录就是使用者的工作区，
     //    AGENTS.md 本来就会自动注入；这里再点一句，保证它真按使用者的设定来（别人的设定同理）。
     // ⭐ 那一轮的工作目录是**插件家**（沙箱只让它写自己工作目录里的东西 ✗），
@@ -1265,12 +1321,9 @@ function reportMeta() {
               + `\n\n评论长度：${({ short: '短（≤15 字）', medium: '中（≤40 字，默认）', long: '长（≤100 字）' })[cfg.commentLength] || '中（≤40 字，默认）'} —— 超了要自己删到这条线内。`
       // ⭐ 2026-10-24：留空不再用内置关键词（那会让所有用户刷同一批视频、评论区扎堆）
       //    ⇒ 留空 = 用 `bili_recommend` 刷**这个账号的首页推荐流**，按各自画像天然散开 ✓
-      + (kws.length
-        ? `关键词用这些：${kws.join('、')}（用 bili_search 搜）。`
-        + `排序用 ${cfg.searchSort || 'pubdate'}（pubdate=最新 · click=播放 · dm=弹幕 · totalrank=综合）；`
-        + `翻页：${Math.max(1, Number(cfg.searchPages) || 2)} 页 —— 用 bili_search(page=1..N)，每页扫一眼标题再决定，别只看第一页；`
-        + `这一轮最多**细看** ${Math.max(1, Number(cfg.fetchPerRound) || 8)} 条（读字幕 / 评论都算一次请求），其余的只扫标题，别把候选全读一遍；`
-        : '没填关键词 ⇒ **这一轮用 bili_recommend 刷首页推荐流**（不要用 bili_search 搜固定词）。')
+      // ⭐ 2026-11 工单 03：口味简报（一段话）优先；老关键词继续生效，只当「你可能想搜这些」。
+      //    整段文本在 lib/taste.mjs（三种情况 + 硬门槛），这里只负责拼进去。
+      + taste
       + `本地转写：${cfg.transcribe
         ? (asrReadyNow()
           ? '开着，而且装好了（没字幕的视频用家里那份 asr.py 转，命令见章程）'
@@ -2924,6 +2977,8 @@ function reportMeta() {
       manualExtra: Math.max(0, Number(st.manualExtra || 0)),
       autoPicked: Math.max(0, pickedTodayCount - manualExtraCount),
       autoLeft: Math.max(0, Number(cfg.perDay || 0) - (pickedTodayCount - manualExtraCount)),
+      // ⭐ 2026-11 工单 03：今天硬门槛挡掉了多少条（从当天日报那行读；关着 / 没这行 = 0）
+      gateBlocked: gateBlockedToday(),
       lastManualAt: st.lastManualAt || null,
       lastRunAt: st.lastRunAt || null,
       lastWhy: st.lastWhy || null,
@@ -3296,7 +3351,7 @@ function reportMeta() {
       // ⭐⭐ 2.0.4（第三方体检第 5 条）：脱敏改成**按字段白名单遮** ——
       //    以前只遮 dmUid，人设全文 / 昵称 / 工作区路径全在，而"复制诊断"是会被贴到群里的 ✗
       const masked = (() => {
-        const SENSITIVE = ['personaPrompt', 'mentionName', 'workspace', 'dshBin', 'dmUid', 'dmOwnerUid', 'keywords']
+        const SENSITIVE = ['personaPrompt', 'mentionName', 'workspace', 'dshBin', 'dmUid', 'dmOwnerUid', 'keywords', 'tasteBrief']
         const c = { ...cfg }
         for (const k of SENSITIVE) {
           const v = c[k]

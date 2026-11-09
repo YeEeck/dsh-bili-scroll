@@ -32,6 +32,9 @@ window.__ModuleLoader__.load({
     const h = React.createElement
 
     const API = '/api/bili-duty'
+    /* ⭐ 2026-11 工单 03：硬门槛数字的上下限（名字 / 含义与 lib/taste.mjs 的 GATE_MAX 一致 ——
+     *    那边是权威（写与读两头都按它钳），这里是输入框的 min/max + 失焦时的即时钳制，改上限要两边一起改）。 */
+    const GATE_UI_MAX = { views: 10_000_000, minutes: 600, days: 365 }
     /* ⚠️ 原来 jget/jpost 直接 .json()、从不看 res.ok ⇒ HTTP 500 的 {ok:false,error}
      *    会被调用方当成「已保存 / 成功」，绿色提示把故障盖掉。（2026-10-16 审查修） */
     const asJson = async (res) => {
@@ -279,6 +282,11 @@ function WatchTab() {
       const [msg, setMsg] = React.useState('')
       const [msgTone, setMsgTone] = React.useState('')
       const [kws, setKws] = React.useState(null)
+      // ⭐ 2026-11 工单 03（口味简报 / 硬门槛）：简报与三条门槛都绑本地草稿（页面每 5 秒轮询 /status）
+      const [brief, setBrief] = React.useState(null)            // 口味简报：一段话
+      const [gateViews, setGateViews] = React.useState(null)    // 硬门槛：最低播放量
+      const [gateMin, setGateMin] = React.useState(null)        // 硬门槛：最短时长（分钟）
+      const [gateDays, setGateDays] = React.useState(null)      // 硬门槛：发布时间窗（天）
       const [favFolders, setFavFolders] = React.useState(null)   // 收藏夹列表（下拉用，null = 还没读）
       const [favId, setFavId] = React.useState(null)             // 选中的收藏夹 fid（字符串）
       const [modelList, setModelList] = React.useState(null)     // /models 的返回（null = 还没读）
@@ -327,6 +335,10 @@ function WatchTab() {
       const cfg = st?.config
       React.useEffect(() => {
         if (cfg && kws === null) setKws((cfg.keywords || []).join('\n'))
+        if (cfg && brief === null) setBrief(cfg.tasteBrief || '')
+        if (cfg && gateViews === null) setGateViews(String(cfg.gateMinViews ?? 0))
+        if (cfg && gateMin === null) setGateMin(String(cfg.gateMinMinutes ?? 0))
+        if (cfg && gateDays === null) setGateDays(String(cfg.gateWithinDays ?? 0))
         if (cfg && persona === null) setPersona(cfg.personaPrompt || '')
         if (cfg && rl === null) setRl(cfg.reportLevel || 'full')
         if (cfg && perDay === null) setPerDay(String(cfg.perDay ?? 5))
@@ -597,13 +609,25 @@ function WatchTab() {
       const onSaveText = async () => {
         const list = String(kws || '').split('\n').map((s) => s.trim()).filter(Boolean)
         const list2 = String(excl || '').split('\n').map((s) => s.trim()).filter(Boolean)
+        const briefText = String(brief || '').trim()
+        // ⭐ 2026-11 工单 03：三条门槛在界面上也钳一遍（宿主那边还会再钳一次，这里是让输入框当场收敛）
+        const nViews = Math.max(0, Math.min(Math.floor(Number(gateViews) || 0), GATE_UI_MAX.views))
+        const nMin = Math.max(0, Math.min(Math.floor(Number(gateMin) || 0), GATE_UI_MAX.minutes))
+        const nDays = Math.max(0, Math.min(Math.floor(Number(gateDays) || 0), GATE_UI_MAX.days))
         // ⭐ 被清空的项要显式带 clear —— 宿主有"空值不覆盖已有值"的保护（防自动保存清空人设），
         //    不带的话用户把关键词/排除词删光了也保存不上，界面还会说"已保存" ✗（2026-10-27 他报的）
         const clear = []
         if (!list.length) clear.push('keywords')
         if (!list2.length) clear.push('excludeWords')
         if (!String(persona || '').trim().length) clear.push('personaPrompt')
-        await patch({ keywords: list, excludeWords: list2, commentLength: String(cLen || 'medium'), searchSort: String(fSort || 'pubdate'), personaPrompt: String(persona || '').trim(), ...(clear.length ? { clear } : {}) }, '关键词 / 排除词 / 人设')
+        if (!briefText.length) clear.push('tasteBrief')     // ⭐ 简报也要能清空（同上：不带 clear 就删不掉）
+        await patch({
+          keywords: list, excludeWords: list2,
+          commentLength: String(cLen || 'medium'), searchSort: String(fSort || 'pubdate'),
+          personaPrompt: String(persona || '').trim(),
+          tasteBrief: briefText, gateMinViews: nViews, gateMinMinutes: nMin, gateWithinDays: nDays,
+          ...(clear.length ? { clear } : {}),
+        }, '口味 / 关键词 / 排除词 / 人设')
       }
 
       if (!cfg) {
@@ -907,19 +931,77 @@ function WatchTab() {
           wsList === null ? h('div', { 'data-bd-note': '' }, '工作区列表读取中…') : null,
           (wsList && wsList.length === 0) ? h('div', { 'data-bd-note': '' }, 'DSH 里还没建过工作区 —— 先在左侧新建一个，再回来选。') : null),
 
-        /* ── 关注什么 / 在哪儿刷 ── */
+        /* ── 口味：想让它找什么 / 硬门槛 / 排除词 ──
+         * ⭐ 2026-11 工单 03：简报（一段话）是「找什么」的主依据；老关键词降成「你可能想搜这些」；
+         *    硬门槛可选、默认关（关着 = 行为与以前一样）。 */
         h('div', { 'data-bd-sec': '', 'data-bd-group': 'taste', 'data-bd-away': tab === 'taste' ? undefined : '' },
-          h('div', { 'data-bd-h': '' }, '关注什么'),
+          h('div', { 'data-bd-h': '' }, '想让它找什么'),
+          h('div', { 'data-bd-label': '' }, '一段话：这一轮想看什么（以它为主）'),
           h('textarea', {
-            'data-bd-input': '', rows: 5, placeholder: '一行一个关键词；留空 = 刷首页推荐流（像人一样随便逛）',
+            'data-bd-input': '', rows: 4,
+            placeholder: '比如：想看真正上手 DeepSeek Harness 的实操，最好带命令和踩坑；少看发布会和吹水的。',
+            value: brief ?? '', onChange: (e) => setBrief(e.target.value),
+          }),
+          h('div', { 'data-bd-note': '' },
+            '它会按这段话自己决定：刷首页推荐流，还是从这段话里提炼几个词去搜 —— 挑的时候也按这段话筛。'
+            + '留空 = 退回老办法（有下面那些关键词就搜关键词，没有就刷推荐流）。'),
+          // ⭐ 和「人设」一样把字数亮出来：宿主那边超 4000 会截（别让人以为写的全生效了）
+          h('div', { 'data-bd-note': '' },
+            '字数：' + String(brief ?? '').length
+            + (String(brief ?? '').length > 4000 ? '（⚠️ 超过 4000，保存时会被截到 4000）' : '')),
+          h('div', { 'data-bd-label': '' }, '老的关键词（当作「你可能想搜这些」）—— 一行一个；填了上面那段话时它只是参考，不是硬指令'),
+          h('textarea', {
+            'data-bd-input': '', rows: 3, placeholder: '一行一个关键词；留空 = 刷首页推荐流（像人一样随便逛）',
             value: kws ?? '', onChange: (e) => setKws(e.target.value),
           }),
+          /* ⭐ 2026-11 工单 03：可选数值硬门槛 —— 默认关；开了先按三条筛，挡掉的条数进日报，也从 /status 读回来 */
+          h('div', { 'data-bd-h': '' }, '硬门槛（可选 · 默认关）'),
+          h(ToggleRow, {
+            label: '先按数值筛一遍',
+            note: '开了以后它先按下面三条挡掉明显不合格的（不读字幕），挡掉的条数会写进当天的日报（日报关着就记不了）。关着 = 行为和以前一样。',
+            on: sw('gateEnabled'),
+            onChange: (v) => patch({ gateEnabled: v }, '硬门槛'),
+          }),
+          sw('gateEnabled') ? h('div', { 'data-bd-sub': '' },
+            h('div', { 'data-bd-row': '' },
+              h('div', { 'data-bd-grow': '' },
+                h('div', { 'data-bd-label': '' }, '最低播放量'),
+                h('div', { 'data-bd-note': '' }, '0 = 不限 · 最多 1000 万')),
+              h('input', {
+                'data-bd-input': '', 'data-bd-num': '', type: 'number', min: 0, max: GATE_UI_MAX.views,
+                value: gateViews ?? '0',
+                onChange: (e) => setGateViews(e.target.value),
+                onBlur: () => { const n = Math.max(0, Math.min(Math.floor(Number(gateViews) || 0), GATE_UI_MAX.views)); setGateViews(String(n)); patch({ gateMinViews: n }, '最低播放量') },
+              })),
+            h('div', { 'data-bd-row': '' },
+              h('div', { 'data-bd-grow': '' },
+                h('div', { 'data-bd-label': '' }, '最短时长（分钟）'),
+                h('div', { 'data-bd-note': '' }, '0 = 不限 · 最多 600（10 小时）')),
+              h('input', {
+                'data-bd-input': '', 'data-bd-num': '', type: 'number', min: 0, max: GATE_UI_MAX.minutes,
+                value: gateMin ?? '0',
+                onChange: (e) => setGateMin(e.target.value),
+                onBlur: () => { const n = Math.max(0, Math.min(Math.floor(Number(gateMin) || 0), GATE_UI_MAX.minutes)); setGateMin(String(n)); patch({ gateMinMinutes: n }, '最短时长') },
+              })),
+            h('div', { 'data-bd-row': '' },
+              h('div', { 'data-bd-grow': '' },
+                h('div', { 'data-bd-label': '' }, '只看最近几天发布的'),
+                h('div', { 'data-bd-note': '' }, '0 = 不限 · 最多 365 天')),
+              h('input', {
+                'data-bd-input': '', 'data-bd-num': '', type: 'number', min: 0, max: GATE_UI_MAX.days,
+                value: gateDays ?? '0',
+                onChange: (e) => setGateDays(e.target.value),
+                onBlur: () => { const n = Math.max(0, Math.min(Math.floor(Number(gateDays) || 0), GATE_UI_MAX.days)); setGateDays(String(n)); patch({ gateWithinDays: n }, '发布时间窗') },
+              })),
+            h('div', { 'data-bd-note': '' }, '三条都填 0 = 等于没开（0 都是「不限」）。'),
+            h('div', { 'data-bd-note': '' },
+              '今天硬门槛挡掉 ' + (Number(st.gateBlocked) || 0) + ' 条（读自今天的日报；这一行由它在报告里写，没写就按 0 算）')) : null,
           h('div', { 'data-bd-label': '' }, '排除词（一行一个）—— 标题 / UP / 简介里出现这些词的，整条跳过'),
           h('textarea', {
             'data-bd-input': '', rows: 3, placeholder: '一行一个词；留空 = 不过滤',
             value: excl ?? '', onChange: (e) => setExcl(e.target.value),
           }),
-          h('div', { 'data-bd-label': '' }, '填了关键词时怎么排序'),
+          h('div', { 'data-bd-label': '' }, '要搜的时候怎么排序'),
           h('select', { 'data-bd-input': '', value: fSort ?? 'pubdate', onChange: (e) => setFSort(e.target.value) },
             h('option', { value: 'pubdate' }, '最新（默认，适合看近几天）'),
             h('option', { value: 'click' }, '播放最多'),
