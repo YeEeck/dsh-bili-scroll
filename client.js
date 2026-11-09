@@ -155,12 +155,6 @@ select[data-bd-input] option,select[data-bd-input] optgroup{
   background:var(--dsw-alias-bg-layer-4,rgba(128,128,128,.14));color:var(--dsw-alias-label-secondary,#c9ccd1);}
 `
 
-    // ⚠️ 与 lib/state.mjs 的 WINDOWS 保持一致（官方口径：工作日 9–12、14–18 是高峰，其余都是谷时）
-    const DEFAULT_WINDOWS = {
-      noon: { label: '中午谷时', start: '12:00', end: '14:00' },
-      night: { label: '晚上/夜间谷时', start: '18:00', end: '09:00' },
-    }
-
     /* ────────────── 小组件 ────────────── */
 
     function Switch({ on, onChange, disabled }) {
@@ -312,6 +306,7 @@ function WatchTab() {
       const [runNote, setRunNote] = React.useState(null)
       const [report, setReport] = React.useState(null)        // 非 null = 报告已展开   // 顶部那行状态（跑一轮/装依赖的反馈原来在最底下，看不见）
       const [queue, setQueue] = React.useState(null)   // 工单 06：候选队列（null = 还没读）
+      const [collectTimes, setCollectTimes] = React.useState(null)   // 工单 09：采集时间点草稿（一行一个 HH:MM）
       const [watchedRows, setWatchedRows] = React.useState(null)   // null = 还没读；[] = 读到了但没记录
       const [watchedPicked, setWatchedPicked] = React.useState(false) // 只看挑中的
     const [watchedState, setWatchedState] = React.useState('')
@@ -353,6 +348,7 @@ function WatchTab() {
         if (cfg && excl === null) setExcl((cfg.excludeWords || []).join('\n'))
         if (cfg && cLen === null) setCLen(cfg.commentLength || 'medium')
         if (cfg && fSort === null) setFSort(cfg.searchSort || 'pubdate')
+        if (cfg && collectTimes === null) setCollectTimes((Array.isArray(cfg.collectTimes) ? cfg.collectTimes : []).join('\n'))
       }, [cfg])
 
       // ⭐ 收藏夹列表：只读一次，读不到就空列表（别每 5 秒重拉）
@@ -388,8 +384,6 @@ function WatchTab() {
         jget('/queue').then((r) => { if (alive.current) setQueue(r && r.ok ? r : { items: [] }) })
           .catch(() => { if (alive.current) setQueue({ items: [] }) })
       }, [st?.queuePending, st?.queueTotal, st?.queueDroppedLast])
-
-      const win = { ...DEFAULT_WINDOWS, ...(st?.windows || {}) }
 
       const say = (text, tone) => {
         setMsg(text); setMsgTone(tone || '')
@@ -557,10 +551,30 @@ function WatchTab() {
         try {
           const r = await jpost('/run', {})
           // ⭐ 2026-10-23：宿主现在会挡"上一轮还在跑"，把它的原话显示出来，别一概说"没起来"
-          if (r?.started) say('已经在后台跑一轮了，报告会写在 out/ 里', 'good')
-          else say(r?.error || '没起来，看 duty.log', 'warn')
+          if (r?.started) {
+            say('已经在后台跑一轮采集了，报告会写在 out/ 里'
+              + (r?.queueFullHint ? '。⚠️ ' + r.queueFullHint : ''), r?.queueFullHint ? 'warn' : 'good')
+          } else say(r?.error || '没起来，看 duty.log', 'warn')
         } catch (e) { say(String(e?.message ?? e), 'warn') }
         finally { setBusy('') }
+      }
+
+      // ⭐ 工单 09：「现在投递」—— 立刻发队头一条（宿主侧手动投递：不看间隔 / 免打扰 / 当日额度）
+      const onDeliver = async () => {
+        setBusy('deliver')
+        try {
+          const r = await jpost('/deliver-now', {})
+          const msg = String(r?.message || (r?.sent ? '已投递' : '没发成'))
+          say(msg, r?.sent ? 'good' : 'warn')
+        } catch (e) { say(String(e?.message ?? e), 'warn') }
+        finally { setBusy('') }
+      }
+
+      // ⭐ 工单 09：采集时间点（一行一个 HH:MM）；清洗 / 排序 / 去重 / 最多 12 个都由宿主做，
+      //    这里只把文本框里非空的行交上去；清空 = []，宿主那边是合法值（= 不按时间点自动采集）。
+      const saveCollectTimes = async () => {
+        const list = String(collectTimes || '').split('\n').map((s) => s.trim()).filter(Boolean)
+        await patch({ collectTimes: list }, '采集时间点')
       }
 
       const onLoginStart = async () => {
@@ -688,6 +702,22 @@ function WatchTab() {
         ? Math.max(0, Math.round((Date.now() - Number(st.runningSince || Date.now())) / 60_000))
         : 0
 
+      /* ⭐ 工单 09：两个手动入口的状态 —— 宿主 /status 已经把「可不可点 / 还剩几秒」算好了，页面只做呈现 */
+      const deliverCooldownSec = Math.max(0, Math.ceil((Number(st?.manualDeliverCooldownRemainingMs) || 0) / 1000))
+      const collectCooldownMin = Math.ceil((Number(st?.manualCollectCooldownRemainingMs) || 0) / 60_000)
+      const deliverDisabled = Boolean(busy) || Boolean(st?.deliveryEnabled) === false
+        || st?.queueEmpty !== false || deliverCooldownSec > 0
+      const deliverTitle = Boolean(st?.deliveryEnabled) === false
+        ? (st?.deliveryPausedReason || '私信关着 —— 不投递')
+        : st?.queueEmpty !== false
+          ? '队列里没有待投递的候选（等下一轮采集）'
+          : deliverCooldownSec > 0
+            ? '刚点过，再等 ' + deliverCooldownSec + ' 秒'
+            : '立刻发队头一条：不看间隔与免打扰、不占当天额度'
+      const nextCollectText = st?.nextCollectAt
+        ? '下一次采集：' + new Date(st.nextCollectAt).toLocaleString('zh-CN')
+        : '还没有下一次采集（时间点空着 ⇒ 只能手动跑）'
+
       return h('div', { 'data-bd-page': '' },
 
         /* ── 今天 ── */
@@ -699,11 +729,18 @@ function WatchTab() {
           // ⭐ 2026-10-23：正在跑的时候把"跑了多久"摆出来 —— 以前连点两次会并行两轮，现在宿主会挡
           st.running ? h('span', { 'data-bd-badge': '' }, '正在跑 ' + runMinutes + ' 分钟') : null,
           h('div', { 'data-bd-grow': '' }),
+          // ⭐ 工单 09：两个手动入口拆开 —— 「现在跑一轮采集」看 running；「现在投递」看队列 / 私信 / 防连点
           h('button', {
-            'data-bd-btn': '', disabled: busy === 'run' || Boolean(st.running),
-            title: st.running ? '上一轮还没跑完；卡住了会在 ' + (st.runTimeoutMinutes || 20) + ' 分钟时自动收掉' : undefined,
+            'data-bd-btn': '', disabled: busy === 'run' || Boolean(st.running) || collectCooldownMin > 0,
+            title: st.running ? '上一轮还没跑完；卡住了会在 ' + (st.runTimeoutMinutes || 20) + ' 分钟时自动收掉'
+              : (collectCooldownMin > 0 ? '刚点过，再等约 ' + collectCooldownMin + ' 分钟' : '立刻跑一轮采集：不看时间点与水位闸'),
             onClick: onRun,
-          }, st.running ? '跑着…' : '现在跑一轮')),
+          }, st.running ? '采集中…' : '现在跑一轮采集'),
+          h('button', {
+            'data-bd-btn': '', disabled: deliverDisabled,
+            title: deliverTitle,
+            onClick: onDeliver,
+          }, busy === 'deliver' ? '投递中…' : '现在投递')),
           runNote ? h('div', { 'data-bd-msg': '', 'data-good': runNote.tone === 'good' ? '' : undefined,
             'data-warn': runNote.tone === 'warn' ? '' : undefined }, runNote.t) : null,
 
@@ -718,20 +755,25 @@ function WatchTab() {
 
         h('div', { 'data-bd-sec': '', 'data-bd-group': 'daily', 'data-bd-away': tab === 'daily' ? undefined : '' },
           h('div', { 'data-bd-h': '' }, '什么时候自己跑'),
-          h(ToggleRow, {
-            label: '峰谷时段自动刷',
-            note: '只在谷时跑 —— 工作日 12:00–14:00 与 18:00 之后（整个周末也算谷时）；关了就只能手动跑',
-            on: sw('peakValley'),
-            onChange: (v) => patch({ peakValley: v }, '峰谷时段自动刷'),
+          h('div', { 'data-bd-row': '' },
+            h('div', { 'data-bd-grow': '' },
+              h('div', { 'data-bd-label': '' }, '采集时间点'),
+              h('div', { 'data-bd-note': '' },
+                '一行一个 HH:MM（本机时间，最多 12 个）；到点跑一轮采集，错过的时点不补跑。'
+                + '留空 = 只手动跑。'))),
+          h('textarea', {
+            'data-bd-input': '', rows: 4,
+            placeholder: '12:30\n19:30',
+            value: collectTimes ?? '',
+            onChange: (e) => setCollectTimes(e.target.value),
+            onBlur: () => { saveCollectTimes() },
           }),
-          sw('peakValley') ? h('div', { 'data-bd-sub': '' },
-            ...['noon', 'night'].map((k) => h(ToggleRow, {
-              key: k,
-              label: win[k].label,
-              note: `${win[k].start} – ${win[k].end}`,
-              on: sw(k),
-              onChange: (v) => patch({ [k]: v }, win[k].label),
-            }))) : null),
+          h('div', { 'data-bd-note': '' }, nextCollectText
+            + (Number(st?.queuePending) > 0 ? ' · 队列里 ' + Number(st.queuePending) + ' 条待投递' : ' · 队列是空的')),
+          st?.lastCollectAt
+            ? h('div', { 'data-bd-note': '' }, '上次采集：' + new Date(st.lastCollectAt).toLocaleString('zh-CN')
+              + (collectCooldownMin > 0 ? ' · 手动冷却还剩约 ' + collectCooldownMin + ' 分钟' : ''))
+            : null),
 
         /* ── 一轮挑几条 ── */
         h('div', { 'data-bd-sec': '', 'data-bd-group': 'daily', 'data-bd-away': tab === 'daily' ? undefined : '' },

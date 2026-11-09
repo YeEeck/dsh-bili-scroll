@@ -4,8 +4,10 @@
  * 它是什么：每天替你刷一轮 B站 的插件版。
  *   1. **插件内部起那份 Python MCP**（`vendor/bilibili-mcp/mcp_server.py`），把它的能力
  *      注册成 dsh 工具（搜 / 字幕 / 评论 / 发评论 @ 人 / 登录检查）—— 用户不用再手改 profile。
- *   2. **谷时定时器**：中午 12:00–14:00、夜间 00:30–08:30（`lib/state.mjs` 里的 `WINDOWS`），
- *      开了哪个窗口才在哪个窗口自动跑；「定量刷」的数字是**每天总量上限**。
+ *   2. **采集时钟**（工单 09）：按使用者配置的固定时间点（`collectTimes`）跑采集轮 ——
+ *      不随机、同一时点当天只跑一次、**错过的时点不补跑**；开跑前先过一道水位闸
+ *      （`lib/collect-clock.mjs`）。旧的谷时窗口（`peakValley` / `noon` / `night`）只留配置兼容，
+ *      **不再驱动行为**。
  *   3. **跑一轮** = 起一个 `dsh --profile headless <prompt>`（跟老方案同一条路，已被验证过），
  *      把 `duty.md` 交给它，报告写进 `<家>/out/<日期>.md`。
  *   4. **设置页**（`client.js`）通过 `/api/bili-duty/*` 读写配置、看状态、扫码登录。
@@ -46,7 +48,8 @@ import {
 } from './lib/queue.mjs'
 import { buildWhitelist } from './lib/tool-whitelist.mjs'
 import { CHANNEL_MIGRATION_FILE, planChannelMigration } from './lib/channels.mjs'
-import { createDeliveryClock, createNotifier, readBaseline } from './lib/delivery-clock.mjs'
+import { createDeliveryClock, createNotifier, readBaseline, totalDeliveredToday } from './lib/delivery-clock.mjs'
+import { collectTick, nextCollectAt, normalizeCollectTimes } from './lib/collect-clock.mjs'
 
 import { loginStart, loginPoll, saveCredential, renderQrPng } from './lib/login.mjs'
 import { resolveUid } from './lib/uid.mjs'
@@ -69,11 +72,15 @@ export const inject = ['webServer', 'tools', 'settings']
 export const Config = !z ? undefined : z.object({
   /** 定量刷：每天最多挑几条 */
   perDay: z.natural().default(5).extra('volatile', true),
-  /** 峰谷自动刷（总开关） */
+  /** 峰谷自动刷（总开关）
+   *  ⚠️ 工单 09 起**不再驱动行为**：采集改由 `collectTimes` 的固定时间点决定；这两项只为老配置兼容保留 */
   peakValley: z.boolean().default(false).extra('volatile', true),
-  /** 峰谷子开关：中午 / 晚上 */
+  /** 峰谷子开关：中午 / 晚上 —— 同 `peakValley`，工单 09 起不再参与行为判断 */
   noon: z.boolean().default(true).extra('volatile', true),
   night: z.boolean().default(true).extra('volatile', true),
+  /** ⭐ 工单 09：采集时间点（本机时区，'HH:MM'）—— 到点跑一轮采集，同一时点当天只跑一次，错过不补跑。
+   *  默认两个时点；最多 12 个（清洗规则见 lib/collect-clock.mjs 的 normalizeCollectTimes / clampPatch） */
+  collectTimes: z.array(z.string()).default(['12:30', '19:30']).extra('volatile', true),
   /** 自动评论 @ 使用者（默认关 —— 会拿用户的号说话，必须他自己开）
    *  ⚠️ 工单 08 起**不再参与行为判断**，只作为迁移来源保留（映射见 lib/channels.mjs）；设置页不再给它单独开关 */
   autoComment: z.boolean().default(false).extra('volatile', true),
@@ -325,6 +332,8 @@ function reportMeta() {
     dmWatch: true, dmWatchMinutes: 1, dmReplyPerDay: 0, dmOwnerUid: 0,
     personaPrompt: '',
     perDay: 5, peakValley: false, noon: true, night: true, autoComment: false, transcribe: false, asrModel: 'small',
+    // ⭐ 工单 09：采集时钟的固定时间点（peakValley / noon / night 只留兼容，不再驱动行为）
+    collectTimes: ['12:30', '19:30'],
     dmMode: 'only', dmUid: 0,
     // ⭐ 工单 08：两个渠道开关（dmMode / autoComment 只留给一次性迁移读，行为不看它们）
     channelDm: true, channelComment: false,
@@ -418,6 +427,9 @@ function reportMeta() {
     if ('queueLimit' in p) p.queueLimit = clampNum(p.queueLimit, QUEUE_LIMIT)
     if ('queueTtlHours' in p) p.queueTtlHours = clampNum(p.queueTtlHours, QUEUE_TTL_HOURS)
     if ('collectBatch' in p) p.collectBatch = clampNum(p.collectBatch, COLLECT_BATCH)
+    // ⭐ 2026-11 工单 09（采集时钟）：固定时间点 —— 只留合法 HH:MM、去重、排序、最多 12 个。
+    //    清洗规则只有一份（lib/collect-clock.mjs 的 normalizeCollectTimes），写与读两头都过它。
+    if ('collectTimes' in p) p.collectTimes = normalizeCollectTimes(p.collectTimes)
     // ⭐ 2026-11 工单 07（自动投递时钟）：每日上限 / 间隔 / 免打扰 / 重试次数，写与读两头都钳。
     //    ⚠️ 免打扰用 'HH:MM' 字符串；写坏了退回默认（起止相同 = 不设免打扰，这由策略判断）。
     if ('deliverPerDay' in p) p.deliverPerDay = clampNum(p.deliverPerDay, { default: 5, min: 0, max: 50 })
@@ -798,16 +810,17 @@ function reportMeta() {
   /** ⭐ 工单 07：故障通知器（写 notifications.jsonl + duty.log + 日报「通知」+ /status） */
   const notifier = createNotifier({ stateDir, outDir, cfg, log })
   /** `/status` 要的两个最少字段：今天已投递几条（口径同 delivery-policy）、最近一次尝试
-   *  ⭐ 工单 07：升级首日还要和一次性基线取最大 —— 否则换账本当天会静默多发一轮。 */
-  const deliveryState = () => {
-    const now = new Date()
+   *  ⭐ 工单 07：升级首日还要加上一次性基线 —— 否则换账本当天会静默多发一轮。
+   *  ⭐ 工单 09：口径修正 —— 基线那天 = **基线 + 当天账本**（两者不重叠：基线只代表新账本之前那部分）；
+   *     跨天只用账本。水位闸与设置页的「已投递 N / M」都用这个口径。 */
+  const deliveryState = (now = new Date()) => {
     const day = dayKey(now)
     const s = summarizeDelivery(readDelivery(stateDir), { day })
     const baseline = readBaseline(stateDir)
     const baselineToday = baseline && baseline.day === day ? Math.max(0, Number(baseline.count) || 0) : 0
     const l = s.lastDelivery
     return {
-      deliveredToday: Math.max(s.deliveredToday, baselineToday),
+      deliveredToday: totalDeliveredToday(s.deliveredToday, baselineToday),
       deliveredBaseline: baselineToday,
       lastDelivery: l ? {
         at: String(l.at ?? ''),
@@ -1054,6 +1067,11 @@ function reportMeta() {
         perDay: cfg.perDay,
         // ⭐ 2026-10-19：这一轮会用哪个 dsh（空 = 没找到 ⇒ 那一轮根本跑不起来）
         dshCli: dshCliCached(),
+        // ⭐ 工单 09：采集时钟 —— 采集按这些固定时间点跑（错过的时点不补跑）
+        collectTimes: collectTimesNow(),
+        nextCollectAt: nextCollectAtOf(now),
+        lastCollectAt: st.lastCollectAt || null,
+        // 旧谷时窗口：只留配置兼容，09 起**不再驱动行为**（报出来供排障 / 老客户端）
         windows: Object.fromEntries(Object.entries(WINDOWS).map(([k, w]) => [k, {
           label: w.label, start: w.start, end: w.end,
           switchOn: Boolean(cfg[k]),
@@ -1077,8 +1095,9 @@ function reportMeta() {
 
   tool({
     name: 'bili_run',
-    description: '**立刻跑一轮**（不等窗口）：起一个 headless 会话，把 duty.md 交给它去刷、写报告。'
-      + '适合"我现在就想看一份"的场合。',
+    description: '**立刻跑一轮采集**（不看时间点与水位闸）：起一个 headless 会话，把 duty.md 交给它去采候选、写报告。'
+      + '手动跑有冷却（`manualCooldownMin`）、队列满了也允许跑（返回里会提示可能发不出去）。'
+      + '⚠️ 它**不是投递** —— 投递由宿主按队列一条一条发；想立刻发一条用设置页的「现在投递」。',
     parameters: {},
     async execute() { const r = runDuty('manual'); return { ok: true, ...r } },
   })
@@ -1126,7 +1145,9 @@ function reportMeta() {
   tool({
     name: 'bili_config',
     description: '读 / 改「刷B站」的设置。不给 `patch` 就是读；给了就改（只认 schema 里的字段）。\n'
-      + '例：`{"perDay":5,"peakValley":true,"noon":true,"night":true,"transcribe":false,"keywords":["DeepSeek Harness"]}`；'
+      + '例：`{"perDay":5,"collectTimes":["12:30","19:30"],"transcribe":false,"keywords":["DeepSeek Harness"]}`'
+      + '（`collectTimes` = 采集时间点，一行一个 `HH:MM`、最多 12 个；到点自动跑采集，同一时点当天只跑一次，错过不补跑；'
+      + '老的 `peakValley` / `noon` / `night` 只留兼容，**不再驱动行为**）；'
       + '渠道（工单 08 起是两个独立开关）：`{"channelDm":true,"channelComment":false,"dmUid":12345678}`'
       + '（私信 = 投递的来源，默认开；公开评论发生在采集轮里，默认关，**人设留空时不可用**）；'
       + '⚠️ 老的 `dmMode` / `autoComment` 只用于一次性迁移，别再写它们；'
@@ -1167,9 +1188,38 @@ function reportMeta() {
     return st
   }
 
-  /* ⭐ 「定量刷」承诺的是**每天挑几条**（2026-10-16 审查修 H1：原来 st.count 从没自增过，
-   *   tick 那道 `count >= perDay` 的闸形同虚设 ⇒ noon + night 两个窗口各跑满一轮，
-   *   后一轮还会把前一轮的报告覆盖掉）。
+  /* ⭐ 工单 09：采集时钟的「今天这个时点跑过没有」。
+   *   state.json 里存 `collectRuns: { 'YYYY-MM-DD HH:MM': true }`（跨天清理，文件不会无限长）；
+   *   读的时候只取今天的键 —— 时钟本身是纯函数（lib/collect-clock.mjs），这里只负责落状态。 */
+  const collectRunsToday = (now = new Date()) => {
+    const st = readJson(dutyStateFile, {})
+    const day = dayKey(now)
+    const runs = st.collectRuns && typeof st.collectRuns === 'object' && !Array.isArray(st.collectRuns) ? st.collectRuns : {}
+    const out = {}
+    for (const [k, v] of Object.entries(runs)) {
+      if (!v) continue
+      const s = String(k)
+      if (s.startsWith(day + ' ')) out[s.slice(day.length + 1)] = true
+    }
+    return out
+  }
+  /** 记下「这个时点今天跑过了」（同时把别的天的键清掉） */
+  const markCollectRun = (now, timeKey, patch = {}) => {
+    const st = readJson(dutyStateFile, {})
+    const day = dayKey(now)
+    const runs = st.collectRuns && typeof st.collectRuns === 'object' && !Array.isArray(st.collectRuns) ? st.collectRuns : {}
+    const next = {}
+    for (const [k, v] of Object.entries(runs)) {
+      const s = String(k)
+      if (v && s.startsWith(day + ' ')) next[s] = true
+    }
+    next[day + ' ' + timeKey] = true
+    bumpState({ collectRuns: next, ...patch })
+  }
+
+  /* ⭐ 「定量刷」承诺的是**每天挑几条**（2026-10-16 审查修 H1：原来 st.count 从没自增过）。
+   *   ⚠️ 工单 09 起**不再用这个数当自动跑的闸门**：采集由 collectTimes 的固定时间点决定，
+   *      水位闸看的是队列与今日投递额度（见 lib/collect-clock.mjs）。这里只保留 /status 与提示词要的账。
    *   数哪儿？数**今天的报告**里那些 `### BV号` 标题行（章程写死了这个格式）。
    *   ⚠️ 为什么不数「报告里出现的所有 BV」（2026-10-17 复查修的）：报告里还会出现**没挑中**的 BV ——
    *     「因无字幕跳过 N 条」那行、评论区里别人问起的视频、"判重表读不到"的说明 —— 全算进去的话，
@@ -1216,15 +1266,8 @@ function reportMeta() {
     } catch { return 0 }
   }
   // ⭐ 2.3.0：手动轮是「额外的一次」—— 自动额度只扣自动轮挑的（manualExtra 是手动轮多挑的那部分）
-  const autoPickedToday = (now = new Date()) => {
-    const st = readJson(dutyStateFile, {})
-    const extra = st.day === dayKey(now) ? Math.max(0, Number(st.manualExtra || 0)) : 0
-    return Math.max(0, countPickedToday(now) - extra)
-  }
-  const roundsToday = (now = new Date()) => {
-    const st = readJson(dutyStateFile, {})
-    return st.day === dayKey(now) ? Number(st.count || 0) : 0
-  }
+  //   ⚠️ 工单 09 起不再有「自动轮挑够 perDay 就不跑」的闸（那个闸已由采集时钟 + 水位闸取代），
+  //      这两个数只留给 /status 与提示词说清楚「今天挑了几条」；别在这里再长出第二套闸。
 
   /* ─────────────── 候选队列（工单 06） ───────────────
    * 采集轮只产出候选：模型用窄口工具 `duty_candidate_append` 把每条写进
@@ -1249,25 +1292,50 @@ function reportMeta() {
     const r = expireQueue(loaded, { now })
     return { queue: r.queue, expired: r.expired }
   }
+  /** ⭐ 工单 09：采集时间点（读的时候再洗一遍 —— 原生设置页那边钳不到写） */
+  const collectTimesNow = () => normalizeCollectTimes(cfg.collectTimes)
+  /** ⭐ 工单 09：下一次采集（给设置页那一行；没配时间点 = null） */
+  const nextCollectAtOf = (now = new Date()) => {
+    try {
+      const d = nextCollectAt(now, collectTimesNow())
+      return d ? d.toISOString() : null
+    } catch { return null }
+  }
+  /** ⭐ 工单 09：手动采集冷却还剩多少毫秒（0 = 现在就能点） */
+  const manualCollectCooldownRemainingMs = (now = new Date()) => {
+    const st = readJson(dutyStateFile, {})
+    const last = Number(st.lastManualAt || 0)
+    const cd = Math.max(0, Number(cfg.manualCooldownMin) || 0) * 60_000
+    if (!last || cd <= 0) return 0
+    return Math.max(0, cd - (now.getTime() - last))
+  }
   /** `/status` 那几个字段：总条数 / 待投递 / 下一条 / 上一轮丢了几条
    *  ⭐ 工单 08：私信关着 ⇒ **不投递** —— 待投递与下一条都报 0/null，并给一句可读原因，
-   *  别让设置页显示"队列里有货、但它永远不会发"。 */
+   *  别让设置页显示"队列里有货、但它永远不会发"。
+   *  ⭐ 工单 09：queueFullHint / queueEmpty 给两个手动按钮做「可点 / 置灰」判断。 */
   const queueStatusFields = () => {
     const { queue } = queueSnapshot()
     const view = queueView(queue, { now: new Date() })
     const st = readJson(dutyStateFile, {})
     const droppedToday = st.day === dayKey() ? Math.max(0, Number(st.queueDroppedLast || 0)) : 0
     const dmOn = Boolean(cfg.channelDm)
+    const limit = queueLimits().limit
+    const pending = dmOn ? view.pending : 0
     return {
       queueTotal: view.total,
-      queuePending: dmOn ? view.pending : 0,
+      queuePending: pending,
       queueNext: dmOn && view.next
         ? { id: view.next.id, bvid: view.next.bvid, title: view.next.title, up: view.next.up,
             expiresAt: view.next.expiresAt, expiresInHours: view.next.expiresInHours }
         : null,
       queueDroppedLast: droppedToday,
       queueExpired: view.expired,
-      queueLimit: queueLimits().limit,
+      queueLimit: limit,
+      // ⭐ 工单 09：队列满的时候手动采集**允许**跑，但要说清「这一轮采到的可能发不出去」
+      queueFullHint: dmOn && pending >= limit
+        ? '队列已满（' + pending + '/' + limit + '）—— 这一轮采到的可能发不出去'
+        : '',
+      queueEmpty: view.pending === 0,
       deliveryEnabled: dmOn,
       deliveryPausedReason: dmOn ? '' : '私信关着 —— 不投递（打开「私信发给我」才会自动发）',
     }
@@ -2412,6 +2480,8 @@ function reportMeta() {
         }
         bumpState({ lastManualAt: Date.now() })
       }
+      // ⭐ 工单 09：记下「最近一次采集开跑的时刻」—— 自动（采集时钟）与手动共用这一笔
+      bumpState({ lastCollectAt: new Date().toISOString() })
     // ⭐ 本地补丁：值班轮 cwd = 设置里的 workspace ⇒ 会话归到该工作区，而不是侧栏「未分组」（见 dutyCwd）
     const cwd = dutyCwd()
     log(`刷B站开跑（${why}）：${dsh.command} ${args.slice(0, 3).join(' ')} …  cwd=${cwd}`)
@@ -2512,46 +2582,72 @@ function reportMeta() {
    }
   }
 
-  /* ─────────────── 谷时定时器 ───────────────
+  /* ─────────────── 采集时钟（工单 09） ───────────────
+   * 按使用者配置的固定时间点（`collectTimes`）跑采集轮：**不随机、同一时点当天只跑一次、
+   * 错过的时点不补跑**；每次开跑前先过一道水位闸（判断全在 lib/collect-clock.mjs，纯逻辑、可直接测）。
+   * 旧的 peakValley / noon / night 配置还在 DEFAULTS 里兼容，但**不再驱动行为**。
+   *
    * 🔴 2026-10-14 事故（使用者那边表现为"DSH 突然崩了、网页 Failed to fetch (gateway/internal)"）：
    *    第一版是 `setInterval(tick, 60_000)`，回调里抛的 TypeError **没人接**，直接把整个宿主进程带走
    *    （`dsh: fatal uncaught exception`）。⇒ **定时器回调必须自己兜住所有异常**：
    *    插件再错也只该"这一轮没跑成"，绝不该杀宿主。
    */
-  const tick = () => {
+  const collectClockTick = () => {
     try {
-      refreshCfg()                    // ⭐ 定时器活得比设置页久：每一跳都重新读一遍配置
-      if (!cfg.peakValley) return
+      refreshCfg()                                  // 定时器活得比设置页久：每一跳都重新读一遍配置
       const now = new Date()
-      const st = readJson(dutyStateFile, {})
-      const today = dayKey(now)
-      // ⭐ 闸门看的是「今天已经**挑到几条**」（从今天的报告里数出来），不是「跑了几轮」
-      if (autoPickedToday(now) >= Number(cfg.perDay || 0)) return
-      // ⭐ 「不写日报」那档没有报告可数 ⇒ 数不出条数就保守一点：一天只跑一轮
-      if (String(cfg.reportLevel || 'full') === 'off' && roundsToday(now) >= 1) return
-      for (const k of ['noon', 'night']) {
-        if (!cfg[k]) continue
-        if (!inWindow(now, WINDOWS[k])) continue
-        const key = `${today}:${k}`
-        if (st.windows?.[key]) continue
-        bumpState({ windows: { ...(st.windows || {}), [key]: true }, count: roundsToday(now) + 1, lastRunAt: now.toISOString(), lastWhy: k })
-        runDuty(`window:${k}`)
+      const lim = queueLimits()
+      const dmOn = cfg.channelDm === true
+      const { queue } = queueSnapshot(now)
+      const delivered = deliveryState(now).deliveredToday
+      const r = collectTick({
+        now,
+        times: collectTimesNow(),
+        runsToday: collectRunsToday(now),
+        queue,
+        deliveredToday: delivered,
+        deliverPerDay: Number(cfg.deliverPerDay) || 0,
+        queueLimit: lim.limit,
+        channelDm: dmOn,
+      })
+      if (r.run) {
+        // ⚠️ 先把「这个时点今天跑过了」落盘，再启动子进程：万一启动失败 / 宿主立刻崩，
+        //    下一次同一分钟内的 tick 也不会重复起一轮（宁可少跑一轮，也别一分钟烧两轮）。
+        const today = dayKey(now)
+        const st = readJson(dutyStateFile, {})
+        const priorCount = st.day === today ? Number(st.count || 0) : 0
+        markCollectRun(now, r.timeKey, {
+          count: priorCount + 1,
+          lastRunAt: now.toISOString(),
+          lastWhy: 'clock:' + r.timeKey,
+        })
+        log('采集时钟：到点了（' + r.timeKey + '）⇒ 跑一轮采集（队列 '
+          + r.pending + ' / ' + lim.limit + ' 条 · 今天已投递 '
+          + delivered + ' / ' + (Number(cfg.deliverPerDay) || 0) + ' 条）')
+        runDuty('clock:' + r.timeKey)
         return
       }
+      // 水位闸跳过 / 时钟写坏了 ⇒ 在 duty.log 里说清楚（'no-slot' 每分钟都有，不刷屏）
+      if (r.reason === 'queue-full' || r.reason === 'quota-full' || r.reason === 'bad-now') {
+        log('采集时钟：跳过 ' + (r.timeKey || '—') + ' —— ' + (r.message || r.reason))
+      }
     } catch (e) {
-      log(`定时器这一跳出错（已兜住，不影响宿主）：${e?.stack ?? e}`)
+      log(`采集时钟这一跳出错（已兜住，不影响宿主）：${e?.stack ?? e}`)
     }
   }
 
   try {
-    const timer = setInterval(tick, 60_000)
-    timer.unref?.()                                    // 别因为这个定时器让进程不肯退出
-    ctx.effect(() => () => clearInterval(timer), 'bili-duty: 谷时定时器')
-  } catch (e) { log(`定时器没起来：${e?.message ?? e}`) }
+    const collectTimer = setInterval(collectClockTick, 60_000)
+    collectTimer.unref?.()                                    // 别因为这个定时器让进程不肯退出
+    ctx.effect(() => () => clearInterval(collectTimer), 'bili-duty: 采集时钟')
+    // ⭐ 启动时立即跑一跳（不阻塞 apply）；**错过的时点不补** —— 这里只认"现在这一分钟"
+    const collectKick = setTimeout(collectClockTick, 0)
+    collectKick.unref?.()
+  } catch (e) { log(`采集时钟没起来：${e?.message ?? e}`) }
 
   /* ─────────────── 自动投递时钟（工单 07） ───────────────
    * 60 秒一跳；启动时立即跑一跳（setTimeout 0，**不阻塞 apply**）。
-   * 和上面的谷时定时器同一条规矩：回调里**所有异常都兜住** —— 未捕获异常会杀整个宿主。
+   * 和上面的采集时钟同一条规矩：回调里**所有异常都兜住** —— 未捕获异常会杀整个宿主。
    * 判断逻辑全在 lib/delivery-clock.mjs（可直接测）；这里只接定时器、刷新配置。
    */
   try {
@@ -3480,7 +3576,8 @@ function reportMeta() {
       // ⭐ 2026-11 工单 03：今天硬门槛挡掉了多少条（从当天日报那行读；关着 / 没这行 = 0）
       gateBlocked: gateBlockedToday(),
       // ⭐ 2026-11 工单 05：投递账的两个最少状态 —— 设置页与 07/09 都读它
-      //    deliveredToday 只数「有回执且非 manual」的（口径同 lib/delivery-policy.mjs）
+      //    deliveredToday = 基线（仅基线那天）+ 当天账本，只数「有回执且非 manual」的
+      //    （口径同 lib/delivery-policy.mjs；水位闸与「已投递 N / M」都用这个数）
       ...deliveryState(),
       // ⭐ 工单 07：故障通知（最近几条，新的在前）—— 设置页 10 显示它；「没找到 / 过期」永远不进来
       notifications: notifier.recent(10),
@@ -3516,6 +3613,12 @@ function reportMeta() {
       })(),
       // ⭐ 2026-10-23：现在有没有一轮在跑（设置页据此把「现在跑一轮」置灰 + 显示已经跑了多久）
       running: Boolean(dutyChild),
+      // ⭐ 工单 09：两个手动入口 + 采集时钟的状态 —— 设置页据此做「可点 / 置灰 / 进行中」
+      collectRunning: Boolean(dutyChild),          // 「现在跑一轮采集」= 复用 running
+      lastCollectAt: st.lastCollectAt || null,     // 最近一次采集开跑的时刻（自动 / 手动共用）
+      nextCollectAt: nextCollectAtOf(),            // 下一次按时间点自动采集（没配时间点 = null）
+      manualCollectCooldownRemainingMs: manualCollectCooldownRemainingMs(),
+      manualDeliverCooldownRemainingMs: deliveryClock.manualCooldownRemainingMs(),
       runningSince: dutyStartedAt || 0,
       runTimeoutMinutes: dutyTimeoutMin(),
       // 2026-10-22：缺哪个 Python 包装不上，得能一眼看出来（出不了二维码 =09 缺 qrcode）
@@ -3555,6 +3658,42 @@ function reportMeta() {
       installTail: (() => { try { return readFileSync(installLogFile, 'utf8').slice(-1400) } catch { return '' } })(),
       report: join(outDir, `${today}.md`),
       log: logFile,
+    }
+  }
+
+  /**
+   * ⭐ 工单 09：「现在投递」的结果 → 设置页直接能显示的一句话。
+   *    deliverNow 的 reason 是机器码（同 07 的口径），这里的映射只做「说人话」，不改变判定。
+   *    @param {object} r deliveryClock.deliverNow() 的返回
+   *    @returns {string}
+   */
+  const manualDeliverMessage = (r = {}) => {
+    const reason = String(r?.reason || '')
+    const waitSec = Math.max(0, Math.ceil((Number(r?.waitMs) || 0) / 1000))
+    switch (reason) {
+      case 'sent':
+        return '已投递 ' + (r?.entry?.bvid || '') + '（手动投递，不占当天额度）'
+      case 'queue-empty':
+        return '队列里没有待投递的候选（等下一轮采集）'
+      case 'cooldown':
+        return '刚点过 —— 再等 ' + waitSec + ' 秒'
+      case 'dm-off':
+        return '私信关着，不投递（在设置里打开「私信发给我」）'
+      case 'no-recipient':
+        return '还没填收件人（设置里的「私信发给谁」/ UID），查不到就不发'
+      case 'locked':
+      case 'busy':
+        return '另一个宿主正在投递 —— 等几秒再点'
+      case 'already-delivered':
+        return '这条在投递账里已有回执（不重复发）—— 再点一次会发下一条'
+      case 'retry-scheduled':
+        return '这次没发出去（' + (r?.error || '接口拒绝') + '）—— 5 分钟后会自动重试一次'
+      case 'sent-failed':
+        return '这次没发出去（' + (r?.error || '接口拒绝') + '）—— 这条已标为失败，继续下一条'
+      case 'bad-now':
+        return '本机时间不对，这一次跳过'
+      default:
+        return r?.message || (r?.ok ? '完成' : '没发成（' + (r?.error || reason || '未知原因') + '）')
     }
   }
 
@@ -3696,7 +3835,8 @@ function reportMeta() {
       for (const k of Object.keys(patch)) {
         if (!isBlank(patch[k])) continue
         // ⭐ 本地补丁：模型这两个字段的"空"是**合法值**（= 跟随当前会话），不该被空值保护挡住
-        if (k === 'modelProvider' || k === 'modelName') continue
+        //    ⭐ 工单 09：collectTimes 的空数组同样是合法值（= 不按时间点自动采集，只能手动跑）
+        if (k === 'modelProvider' || k === 'modelName' || k === 'collectTimes') continue
         const cur = (cfg[k] !== undefined && cfg[k] !== null) ? cfg[k] : savedForGuard[k]
         const curNotEmpty = cur !== '' && cur !== null && cur !== undefined && !(Array.isArray(cur) && cur.length === 0)
         if (curNotEmpty && !clears.includes(k)) {
@@ -3720,9 +3860,29 @@ function reportMeta() {
       })
     }
 
+    // ⭐ 工单 09：「现在跑一轮采集」—— 不看时间点、也不看水位闸，带 manualCooldownMin 冷却。
+    //    队列已满时**允许**跑，但返回里带一句可读提示（这一轮采到的可能发不出去）。
     if (req.method === 'POST' && path === '/api/bili-duty/run') {
       if (cfg.channelDm && !(Number(cfg.dmUid) > 0)) await warmDmUid()
-      return sendJson(res, 200, { ok: true, ...runDuty('manual') })
+      const qs = queueStatusFields()
+      if (qs.queueFullHint) log('手动采集：' + qs.queueFullHint)
+      const r = runDuty('manual')
+      return sendJson(res, 200, {
+        ok: true, ...r,
+        queueFullHint: qs.queueFullHint,
+        manualCollectCooldownRemainingMs: manualCollectCooldownRemainingMs(),
+      })
+    }
+
+    // ⭐ 工单 09：「现在投递」—— 立刻发队头一条（手动投递：不看间隔 / 免打扰 / 当日额度，不占额度）。
+    //    ⚠️ **不再包一层发送锁**：跨宿主锁在 createDeliveryClock / lib/send.mjs 里各有一道，
+    //       这里只负责调它、把 reason 翻成一句人话。它不是模型工具。
+    if (req.method === 'POST' && path === '/api/bili-duty/deliver-now') {
+      const result = await deliveryClock.deliverNow()
+      const message = manualDeliverMessage(result)
+      log('手动投递：' + (result?.sent ? '已投递 ' + (result?.entry?.bvid || '') : '没发成（' + (result?.reason || '?') + '）')
+        + ' —— ' + message)
+      return sendJson(res, 200, { ok: result?.ok === true, ...result, message })
     }
 
     // ⭐ 2026-11 工单 05：宿主发送一条纯文本私信（**不是模型工具**，模型没有发送权）
@@ -4151,7 +4311,7 @@ function reportMeta() {
   try { ensureDutyProfile() } catch { /* 上面已记日志 */ }
   if (dutyProfileState === 'ok') log('值班轮用最小权限 profile：bili-duty（无文件系统 / 无命令 / 无联网）')
   else log('⚠️ 最小权限 profile 不可用（' + dutyProfileState + '）⇒ 值班轮仍用 headless（这一轮能力偏大）')
-  log(`已挂载（家=${stateDir}，python=${cfg.pythonPath}，峰谷=${cfg.peakValley ? '开' : '关'}）`)
+  log(`已挂载（家=${stateDir}，python=${cfg.pythonPath}，采集时间点=${collectTimesNow().join(' / ') || '（无，只能手动）'}）`)
   // ⭐ 2026-10-25：历史清理 —— 以前每轮留下的值班会话也归档掉（只碰 bili-duty 桶）。
   //    延迟几秒：workspaceRegistry 服务未必比这个插件先就绪。
   try {
