@@ -223,7 +223,7 @@ function startHost({ cfg = {} } = {}) {
 
 const commentOnCfg = { autoComment: true, mentionName: '阿七', dmMode: 'both', dmUid: 12345 }
 
-/* 私信仍可发：dmMode=both、填了 UID ⇒ 白名单里一直有 bili_send_message */
+/* 工单 06：采集轮**没有** bili_send_message（发送权归宿主）；公开评论按 04 的三条闸 */
 
 test('bili_reply：人设留空 ⇒ 即使「自动评论」开着也挡下，并写日志；/status 给出可读原因', async () => {
   const h = startHost({ cfg: commentOnCfg })
@@ -296,7 +296,7 @@ test('采集轮提示词：人设文本进提示词，公开评论开着，白�
   assert.equal(st.personaSource, 'text')
 })
 
-test('采集轮提示词：人设留空 ⇒ 没有人设段、不公开说话，白名单不给 bili_reply（私信仍在）', async () => {
+test('采集轮提示词：人设留空 ⇒ 没有人设段、不公开说话，白名单不给 bili_reply、也没有 bili_send_message', async () => {
   const h = startHost({ cfg: commentOnCfg })
   await h.round('')
   const p = h.prompt()
@@ -309,7 +309,8 @@ test('采集轮提示词：人设留空 ⇒ 没有人设段、不公开说话，
 
   const overlay = h.overlay()
   assert.ok(!overlay.includes('bili_reply'), '人设留空时值班轮不该拿到评论工具')
-  assert.ok(overlay.includes('bili_send_message'), '私信不受人设限制')
+  assert.ok(!overlay.includes('bili_send_message'), '工单 06：采集轮没有发送私信的手（发送权归宿主）')
+  assert.ok(overlay.includes('duty_candidate_append'), '采集轮要把候选交给宿主')
 
   const st = await h.call('GET', '/api/bili-duty/status')
   assert.equal(st.commentAvailable, false)

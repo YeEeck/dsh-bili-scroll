@@ -106,7 +106,7 @@ const oneComment = (h) => {
   fakeCred(h)
 }
 
-test('A：默认只私信、没发过评论，第二轮只有 ### BV ⇒ 收尾写投递不剪第二轮', async () => {
+test('A：没发过评论，第二轮只有 ### BV ⇒ 收尾写投递不剪第二轮（工单 06 之后这一轮没有候选）', async () => {
   const h = startHost()
   noCommentYet(h)
   await h.round(block('BV1aaaaaaaaa', '一轮') + '\n结尾总结一轮')
@@ -192,7 +192,7 @@ test('子串：模型写了 ### 投递情况 ⇒ 不算 ## 投递 那一节', as
 test('#155：改好配置后，上一轮的备注不再写进后面的报告，也不重复累积', async () => {
   const h = startHost({ cfg: { dmUid: 0 } })
   await h.round(block('BV1aaaaaaaaa', '一轮'))
-  assert.ok(h.report().includes('⛔ 这一轮什么都不会发出去'))
+  assert.ok(h.report().includes('⛔ 之后投不出去'))
   h.writeCfg({ dmUid: 12345 })
   await h.round(block('BV1bbbbbbbbb', '二轮'))
   await h.round(block('BV1ccccccccc', '三轮'))

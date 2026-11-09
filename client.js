@@ -312,6 +312,7 @@ function WatchTab() {
       const [login, setLogin] = React.useState(null)
       const [runNote, setRunNote] = React.useState(null)
       const [report, setReport] = React.useState(null)        // 非 null = 报告已展开   // 顶部那行状态（跑一轮/装依赖的反馈原来在最底下，看不见）
+      const [queue, setQueue] = React.useState(null)   // 工单 06：候选队列（null = 还没读）
       const [watchedRows, setWatchedRows] = React.useState(null)   // null = 还没读；[] = 读到了但没记录
       const [watchedPicked, setWatchedPicked] = React.useState(false) // 只看挑中的
     const [watchedState, setWatchedState] = React.useState('')
@@ -383,6 +384,12 @@ function WatchTab() {
         jget('/workspaces').then((r) => { if (alive.current) setWsList(r && r.ok ? (r.workspaces || []) : []) })
           .catch(() => { if (alive.current) setWsList([]) })
       }, [wsList])
+
+      // ⭐ 2026-11-09（工单 06）：队列现状 —— 条数变了就重读一次（/status 是 5 秒轮询，别每跳都拉）
+      React.useEffect(() => {
+        jget('/queue').then((r) => { if (alive.current) setQueue(r && r.ok ? r : { items: [] }) })
+          .catch(() => { if (alive.current) setQueue({ items: [] }) })
+      }, [st?.queuePending, st?.queueTotal, st?.queueDroppedLast])
 
       const win = { ...DEFAULT_WINDOWS, ...(st?.windows || {}) }
 
@@ -740,6 +747,28 @@ function WatchTab() {
               onBlur: () => { const n = Math.max(0, Math.min(Number(perDay) || 0, 50)); setPerDay(String(n)); patch({ perDay: n }, '每天挑几条') },
             })),
           st.lastRunAt ? h('div', { 'data-bd-note': '' }, `上次跑：${new Date(st.lastRunAt).toLocaleString('zh-CN')}`) : null),
+
+        /* ── 队列（工单 06）：采集轮攒下来的候选 ──（10 会把它挪到「今天」那块；先保证能看见） */
+        h('div', { 'data-bd-sec': '', 'data-bd-group': 'daily', 'data-bd-away': tab === 'daily' ? undefined : '' },
+          h('div', { 'data-bd-h': '' }, '队列（等着发给你的候选）'),
+          h('div', { 'data-bd-note': '' },
+            queue === null
+              ? '读取中…'
+              : (Number(st?.queuePending) || 0) + ' 条待投递'
+                + (Number(st?.queueLimit) ? ' · 上限 ' + Number(st.queueLimit) + ' 条' : '')
+                + (st?.queueNext ? ' · 下一条：' + st.queueNext.title : '')),
+          queue && Array.isArray(queue.items) && queue.items.length
+            ? h('div', { 'data-bd-list': '' }, queue.items.map((x) => h('div', { key: x.id, 'data-bd-item': '' },
+                h('div', { 'data-bd-item-body': '' },
+                  h('div', { 'data-bd-item-t': '' }, x.title || x.bvid),
+                  h('div', { 'data-bd-item-n': '' },
+                    x.bvid + ' · ' + (x.up || '未知 UP')
+                    + ' · 还能放 ' + Math.max(0, Math.round(Number(x.expiresInHours) || 0)) + ' 小时')))))
+            : h('div', { 'data-bd-note': '' }, queue === null ? '' : '队列是空的 —— 采集轮挑到候选后会攒在这儿'),
+          Number(st?.queueDroppedLast) > 0
+            ? h('div', { 'data-bd-note': '' }, '上一轮队列满了，有 ' + Number(st.queueDroppedLast) + ' 条没进来（上限 '
+              + (Number(st.queueLimit) || 3) + ' 条）—— 详情在今天的日报「队列」一节')
+            : null),
 
         /* ── 用哪个模型跑 ──（⭐ 2026-11-04：挪到「高级」—— 它装的时候定一次就好，不是每天会动的东西；摆在「日常」里会让人以为要天天调） */
         h('div', { 'data-bd-sec': '', 'data-bd-group': 'adv', 'data-bd-away': tab === 'adv' ? undefined : '' },

@@ -66,3 +66,67 @@ test('CRLF 的报告也认得出这一节', () => {
   const cur = '# 日报\r\n\r\n## 投递\r\n\r\n- 旧备注\r\n\r\n### BV1aaaaaaaaa\r\n正文\r\n'
   assert.equal(replaceSect(cur, '## 投递', NOTES), '# 日报\n\n## 投递\n\n- 新备注\n\n### BV1aaaaaaaaa\r\n正文\n\n')
 })
+
+/* ─────────── 工单 06：`## 队列` 那种「### BV 子块 + - 字段」的节 ─────────── */
+
+const queueBlock = (bv, n = 1) => [
+  '## 队列',
+  '',
+  `### ${bv}`,
+  '- 标题：合成标题',
+  '- UP：合成UP',
+  '- 状态：待投递',
+  '- 采集：2026-11-09 23:30 · 到期：2026-11-10 23:30',
+  '- 草稿：这条讲得挺清楚',
+  '',
+  `- 本轮：入队 ${n} 条 · 丢弃 0 条 · 过期 0 条 · 跳过 0 条 · 现在队列里 ${n} 条待投递`,
+].join('\n')
+
+test('队列节（subheads）：子块 + 统计一起换掉，只留一节，后面的模型内容不被剪', () => {
+  let t = replaceSect('# 日报\n\n', '## 队列', queueBlock('BV1aaaaaaaaa'), { subheads: true })
+  t += '第一轮总结\n'
+  t = replaceSect(t, '## 队列', queueBlock('BV1bbbbbbbbb', 2), { subheads: true })
+  assert.equal((t.match(/^## 队列$/gm) || []).length, 1, '只留一节')
+  assert.ok(t.includes('### BV1bbbbbbbbb'), '换成最新的那批')
+  assert.ok(!t.includes('### BV1aaaaaaaaa'), '旧的那条子块不该留着')
+  assert.ok(t.includes('第一轮总结'), '模型写的内容要留着')
+  assert.equal((t.match(/^- 草稿：/gm) || []).length, 1)
+})
+
+test('队列节：后面紧跟模型自己写的 `### BV号` + 普通文字 ⇒ 不吞（那是别人的内容）', () => {
+  const model = '### BV1zzzzzzzzz\n标题：模型自己写的\n**档位**：可以看\n'
+  const cur = '# 日报\n\n' + queueBlock('BV1aaaaaaaaa') + '\n' + model + '\n第二轮总结\n'
+  const out = replaceSect(cur, '## 队列', queueBlock('BV1bbbbbbbbb'), { subheads: true })
+  assert.ok(out.includes(model), '模型的 ### BV 块一个字都不能少')
+  assert.ok(out.includes('第二轮总结'))
+  assert.equal((out.match(/^## 队列$/gm) || []).length, 1)
+})
+
+test('队列节：后面跟着别的宿主节 ⇒ 各换各的，都不出声', () => {
+  const cur = '# 日报\n\n' + queueBlock('BV1aaaaaaaaa') + '\n## 投递\n\n- 旧备注\n\n### BV1bbbbbbbbb\n模型内容\n'
+  let t = replaceSect(cur, '## 队列', queueBlock('BV1ccccccccc', 2), { subheads: true })
+  t = replaceSect(t, '## 投递', '## 投递\n\n- 新备注\n')
+  assert.equal((t.match(/^## 队列$/gm) || []).length, 1)
+  assert.equal((t.match(/^## 投递$/gm) || []).length, 1)
+  assert.ok(t.includes('- 新备注'))
+  assert.ok(t.includes('模型内容'))
+  assert.ok(t.includes('### BV1ccccccccc'))
+})
+
+test('subheads 默认关：旧那两节的行为一个字都不变（`### ` 行不吃）', () => {
+  const cur = '## 投递\n\n- 旧备注\n\n### 模型自己的小节\n正文\n'
+  assert.equal(replaceSect(cur, '## 投递', NOTES), '## 投递\n\n- 新备注\n\n### 模型自己的小节\n正文\n\n')
+  // 开了也一样：`### 队列说明` 不是 BV 子块，不吃
+  const cur2 = '## 队列\n\n' + '- 旧的一行\n\n### 队列说明\n模型写的\n'
+  const out = replaceSect(cur2, '## 队列', queueBlock('BV1aaaaaaaaa'), { subheads: true })
+  assert.ok(out.includes('### 队列说明\n模型写的'))
+})
+
+test('队列节：模型写的是 `### BV号` + 一串自己的 `- ` 行（没有宿主标签）⇒ 也不吞', () => {
+  const model = '### BV1zzzzzzzzz\n- 值得一看\n- https://www.bilibili.com/video/BV1zzzzzzzzz\n'
+  const cur = '# 日报\n\n' + queueBlock('BV1aaaaaaaaa') + '\n' + model
+  const out = replaceSect(cur, '## 队列', queueBlock('BV1bbbbbbbbb'), { subheads: true })
+  assert.ok(out.includes(model), '模型自己的列表小节一个字都不能少')
+  assert.ok(out.includes('### BV1bbbbbbbbb'))
+  assert.equal((out.match(/^### BV1aaaaaaaaa$/gm) || []).length, 0, '旧的那条子块换成新的')
+})

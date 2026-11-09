@@ -1337,16 +1337,18 @@ def _append(path: Path, text: str) -> str:
 @tool()
 def duty_paths() -> str:
     """
-    这一轮允许写的三个位置（绝对路径）—— 想写东西只能通过这些 duty_* 工具，不要找别的路。
+    这一轮允许写的位置（绝对路径）—— 想写东西只能通过这些 duty_* 工具，不要找别的路。
 
     Returns:
-        报告 / 判重表 / 归档 的绝对路径
+        家目录 / 日报 / 判重表 / 归档 / 队列收件箱 的绝对路径
     """
     out = {
         "home": str(DUTY_HOME),
         "report": str(DUTY_HOME / "out" / (_duty_today() + ".md")),
         "seen": str(DUTY_HOME / "seen.md"),
         "digest": str(DUTY_HOME / "digest" / (_dt.datetime.now().strftime("%Y-%m") + ".md")),
+        # ⭐ 2026-11-09（工单 06）：候选队列的收件箱（采集轮椅进去，宿主这一轮结束后入队）
+        "inbox": str(DUTY_HOME / "queue-inbox.jsonl"),
     }
     return json.dumps(out, ensure_ascii=False)
 
@@ -1371,6 +1373,40 @@ def duty_report_append(text: str) -> str:
     if fresh:
         payload = "# 刷B站日报 " + _duty_today() + "\n\n" + payload
     return "已追加到 " + _append(p, payload)
+
+
+@tool()
+def duty_candidate_append(bvid: str, title: str, up: str, draft: str) -> str:
+    """
+    把这一轮挑中的**一条候选**写进队列收件箱（宿主在这一轮结束后统一校验、入队）。
+
+    ⚠️ 采集轮**不发任何私信**：候选只往这儿写，发送由宿主之后按队列来。
+    ⚠️ 一条候选只写一次（同一个 BV 重复写，宿主入队时会按重复丢掉）。
+
+    Args:
+        bvid: BV 号（形如 BV1xxxxxxxxx）
+        title: 标题
+        up: UP 主
+        draft: 之后要发给使用者的那段正文（按人设写；别写设置名 / 内部术语 / 流程口径）
+
+    Returns:
+        记到了哪儿 / 为什么没记
+    """
+    bv = str(bvid or "").strip()
+    if not re.match(r"^BV[0-9A-Za-z]{10}$", bv):
+        return "没写：bvid 不对（应形如 BV1xxxxxxxxx，收到的是 " + bv[:40] + "）"
+    rec = {
+        "bvid": bv,
+        "title": " ".join(str(title or "").split())[:200],
+        "up": " ".join(str(up or "").split())[:80],
+        "draft": str(draft or "").replace("\r\n", "\n").strip()[:4000],
+        "at": _dt.datetime.now().isoformat(timespec="seconds"),
+    }
+    if not rec["draft"]:
+        return "没写：draft 是空的（每条候选都要带一段之后能发出去的正文）"
+    return "已收进队列收件箱（宿主这一轮结束后入队）：" + bv + " → " + _append(
+        DUTY_HOME / "queue-inbox.jsonl", json.dumps(rec, ensure_ascii=False) + "\n"
+    )
 
 
 @tool()
