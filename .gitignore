@@ -16,3 +16,6 @@ log/
 __pycache__/
 *.pyc
 style-probe-*/
+
+# 本地 markdown issue tracker（见 docs/agents/issue-tracker.md）
+.scratch/
