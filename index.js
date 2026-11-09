@@ -3752,12 +3752,24 @@ function reportMeta() {
 
     // ⭐ 2026-11 工单 06：队列接口 —— 设置页的「队列」面板读它；07 的投递时钟也用它取"下一条"。
     //    只列**还能投递的**（pending）：过期 / 已投递的不出现（spec「过期条目不再出现在可投递视图里」）。
+    //    ⭐ 工单 10：另外给一份 `finished`（已投递 / 已过期 / 投递失败，最近 10 条）——
+    //    spec「接口契约」要求这个接口返回「条数、状态、最后时间、失败原因」，设置页要逐条显示状态；
+    //    `items` 的语义**保持不变**（仍然只有 pending），免得把"可投递视图"弄浑。
     if (req.method === 'GET' && path === '/api/bili-duty/queue') {
       const { queue } = queueSnapshot()
       const view = queueView(queue, { now: new Date() })
       const st = readJson(dutyStateFile, {})
       const today = dayKey()
       const dmOn = Boolean(cfg.channelDm)
+      const finished = (Array.isArray(queue?.entries) ? queue.entries : [])
+        .filter((e) => e && e.status && e.status !== 'pending')
+        .sort((a, b) => (Date.parse(b.collectedAt) || 0) - (Date.parse(a.collectedAt) || 0))
+        .slice(0, 10)
+        .map((e) => ({
+          id: e.id, bvid: e.bvid, title: e.title, up: e.up,
+          status: e.status, collectedAt: e.collectedAt, expiresAt: e.expiresAt,
+          attempts: e.attempts, lastError: e.lastError,
+        }))
       // ⭐ 工单 08：私信关着 ⇒ 不投递。可投递视图（pending / next / items）一律清空，
       //    只留 total 供对账 + 一句原因 —— 不给 UI 留"有货但不会发"的错觉。
       return sendJson(res, 200, {
@@ -3766,6 +3778,7 @@ function reportMeta() {
         pending: dmOn ? view.pending : 0,
         next: dmOn ? view.next : null,
         items: dmOn ? view.items : [],
+        finished,
         limits: queueLimits(),
         droppedLast: st.day === today ? Math.max(0, Number(st.queueDroppedLast || 0)) : 0,
         enqueuedLast: st.day === today ? Math.max(0, Number(st.queueEnqueuedLast || 0)) : 0,

@@ -350,3 +350,30 @@ test('POST /config：collectTimes 清洗（只留合法 HH:MM、去重、排序�
   const st = await h.status()
   assert.equal(st.nextCollectAt, null)
 })
+
+/* ───────────── ⑧ GET /queue：队列面板要逐条看到状态（工单 10） ───────────── */
+
+test('GET /queue：items 仍然只有 pending；finished 给出已投递 / 已过期 / 投递失败（含失败原因）', async () => {
+  const h = startHost()
+  h.putQueue([
+    entry(BVID_A),
+    entry(BVID_B, { status: 'sent', attempts: 1 }),
+    entry(BVID_C, { status: 'expired' }),
+    entry(BVID_D, { status: 'failed', attempts: 2, lastError: '21007 风控' }),
+  ])
+  const q = await h.call('GET', '/api/bili-duty/queue')
+  assert.equal(q.ok, true)
+  // 可投递视图的语义不变：只有 pending（spec「过期条目不再出现在可投递视图里」）
+  assert.deepEqual(q.items.map((x) => x.bvid), [BVID_A])
+  assert.equal(q.pending, 1)
+  assert.equal(q.total, 4)
+  // finished：设置页的队列面板靠它显示「已投递 / 已过期 / 投递失败 + 失败原因」
+  const byBv = new Map(q.finished.map((x) => [x.bvid, x]))
+  assert.deepEqual([...byBv.keys()].sort(), [BVID_B, BVID_C, BVID_D].sort())
+  assert.equal(byBv.get(BVID_B).status, 'sent')
+  assert.equal(byBv.get(BVID_C).status, 'expired')
+  assert.equal(byBv.get(BVID_D).status, 'failed')
+  assert.equal(byBv.get(BVID_D).lastError, '21007 风控', '失败原因要能显示出来')
+  assert.ok(!byBv.has(BVID_A), 'pending 不该重复出现在 finished 里')
+  assert.ok(byBv.get(BVID_B).collectedAt, '采集时间要给（面板上要显示）')
+})

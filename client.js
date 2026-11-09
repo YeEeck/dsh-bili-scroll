@@ -153,6 +153,25 @@ select[data-bd-input] option,select[data-bd-input] optgroup{
 [data-bd-kv]{font-size:11px;line-height:18px;color:var(--dsw-alias-label-tertiary,#9aa0a6);word-break:break-all;}
 [data-bd-badge]{font-size:11px;padding:2px 7px;border-radius:6px;
   background:var(--dsw-alias-bg-layer-4,rgba(128,128,128,.14));color:var(--dsw-alias-label-secondary,#c9ccd1);}
+    /* ⭐ 2026-11 工单 10（设置页重组）：
+       · 长标题 / 失败原因一律换行，别把窄屏撑出横向滚动条（不写死容器宽度）；
+       · 时刻输入框（免打扰起止）跟数字框一样有固定的小宽度，但 max-width 兜住窄屏；
+       · 队列逐条状态：待投递 / 已投递 / 已过期 / 投递失败 各自一个颜色。 */
+    [data-bd-note],[data-bd-label],[data-bd-h]{word-break:break-word;}
+    [data-bd-time]{flex:none;width:110px;max-width:100%;color-scheme:light dark;}
+    [data-bd-input][disabled]{opacity:.5;cursor:default;}
+    [data-bd-qlist]{display:flex;flex-direction:column;gap:6px;margin-top:2px;}
+    [data-bd-qrow]{display:flex;flex-direction:column;gap:3px;min-width:0;padding:7px 9px;border-radius:8px;
+      background:var(--dsw-alias-bg-layer-1,rgba(127,127,127,.06));
+      border:1px solid var(--dsw-alias-bg-layer-3,rgba(127,127,127,.22));}
+    [data-bd-qrow-t]{font-size:13px;line-height:18px;font-weight:600;word-break:break-word;}
+    [data-bd-qrow-n]{font-size:11px;line-height:16px;color:var(--dsw-alias-label-tertiary,#9aa0a6);word-break:break-all;}
+    [data-bd-qstat]{flex:none;font-size:11px;line-height:16px;padding:1px 7px;border-radius:6px;
+      background:var(--dsw-alias-bg-layer-4,rgba(128,128,128,.14));color:var(--dsw-alias-label-secondary,#c9ccd1);}
+    [data-bd-qstat='pending']{color:#60a5fa;}
+    [data-bd-qstat='sent']{color:#22c55e;}
+    [data-bd-qstat='expired']{color:var(--dsw-alias-label-tertiary,#9aa0a6);}
+    [data-bd-qstat='failed']{color:#ef4444;}
 `
 
     /* ────────────── 小组件 ────────────── */
@@ -173,6 +192,53 @@ select[data-bd-input] option,select[data-bd-input] optgroup{
           h('div', { 'data-bd-label': '' }, label),
           note ? h('div', { 'data-bd-note': '' }, note) : null),
         h(Switch, { on, onChange, disabled }))
+    }
+
+    /* ⭐ 2026-11 工单 10：「标签 + 说明 + 输入框」那两行（数字 / 时刻）。
+     *    ⚠️ 值一律由调用方给的**本地草稿**决定 —— 页面每 5 秒轮询一次 /status，
+     *    直接绑配置的话，用户打字打到一半就被服务端那份冲掉了（同 2026-10-14 那次）。 */
+    function NumRow({ label, note, value, min, max, onChange, onBlur, disabled }) {
+      return h('div', { 'data-bd-row': '' },
+        h('div', { 'data-bd-grow': '' },
+          h('div', { 'data-bd-label': '' }, label),
+          note ? h('div', { 'data-bd-note': '' }, note) : null),
+        h('input', {
+          'data-bd-input': '', 'data-bd-num': '', type: 'number', min, max,
+          value: value ?? '',
+          disabled: Boolean(disabled),
+          onChange: (e) => onChange(e.target.value),
+          onBlur,
+        }))
+    }
+
+    function ClockRow({ label, note, value, onChange, onBlur, disabled }) {
+      return h('div', { 'data-bd-row': '' },
+        h('div', { 'data-bd-grow': '' },
+          h('div', { 'data-bd-label': '' }, label),
+          note ? h('div', { 'data-bd-note': '' }, note) : null),
+        h('input', {
+          'data-bd-input': '', 'data-bd-time': '', type: 'time', step: 60,
+          value: value ?? '',
+          disabled: Boolean(disabled),
+          onChange: (e) => onChange(e.target.value),
+          onBlur,
+        }))
+    }
+
+    /* ⭐ 2026-11 工单 10：「说人话」的几张小表 —— 键分别来自 lib/queue.mjs（队列状态）、
+     *    lib/ledger.mjs（投递账状态）和 lib/delivery-clock.mjs（通知种类）。只做显示，不改判定。 */
+    const QUEUE_STATUS_TEXT = { pending: '待投递', sent: '已投递', expired: '已过期', failed: '投递失败' }
+    const LEDGER_STATUS_TEXT = {
+      sent: '已送达（拿到回执）',
+      'no-receipt': '接口说成功、但没回执（不算已投递）',
+      failed: '接口拒绝',
+      error: '网络 / 工具出错',
+      blocked: '发送前被机械检查挡下',
+    }
+    const NOTIFY_KIND_TEXT = { 'collect-failed': '采集失败', 'delivery-failed': '投递失败' }
+    const fmtTime = (v) => {
+      const d = v ? new Date(v) : null
+      return d && !Number.isNaN(d.getTime()) ? d.toLocaleString('zh-CN') : '—'
     }
 
     function useStatus(intervalMs) {
@@ -297,15 +363,18 @@ function WatchTab() {
       const [perDay, setPerDay] = React.useState(null)
       const [perRound, setPerRound] = React.useState(null)
       const [replyPer, setReplyPer] = React.useState(null)
-      const [dmUid, setDmUid] = React.useState(null)        // 私信收件人 UID（本地草稿）
       const [dmWatch, setDmWatch] = React.useState(null)          // 私信双向开关
       const [mention, setMention] = React.useState(null)
       const [mProv, setMProv] = React.useState(null)      // 手填模型的 provider（只在读不到模型列表时露出来）
       const [mName, setMName] = React.useState(null)      // 手填模型的 model id
       const [login, setLogin] = React.useState(null)
-      const [runNote, setRunNote] = React.useState(null)
-      const [report, setReport] = React.useState(null)        // 非 null = 报告已展开   // 顶部那行状态（跑一轮/装依赖的反馈原来在最底下，看不见）
+      /* ⭐ 2026-11 工单 10：采集 / 投递那些数字与时刻的**本地草稿**（键 = 配置键）。
+       *    和上面 perDay 那几个是同一个道理：页面每 5 秒轮询 /status，直接绑 cfg 会被冲掉。
+       *    没在这张表里的键 ⇒ 显示服务端那份（还没动过的项就该跟着服务端走）。 */
+      const [drafts, setDrafts] = React.useState({})
+      const [report, setReport] = React.useState(null)        // 非 null = 报告已展开
       const [queue, setQueue] = React.useState(null)   // 工单 06：候选队列（null = 还没读）
+      const [queueNonce, setQueueNonce] = React.useState(0)   // 工单 10：手动投递 / 采集后立刻重读队列
       const [collectTimes, setCollectTimes] = React.useState(null)   // 工单 09：采集时间点草稿（一行一个 HH:MM）
       const [watchedRows, setWatchedRows] = React.useState(null)   // null = 还没读；[] = 读到了但没记录
       const [watchedPicked, setWatchedPicked] = React.useState(false) // 只看挑中的
@@ -342,7 +411,6 @@ function WatchTab() {
         if (cfg && mention === null) setMention(cfg.mentionName || '')
         if (cfg && mProv === null) setMProv(cfg.modelProvider || '')
         if (cfg && mName === null) setMName(cfg.modelName || '')
-        if (cfg && dmUid === null) setDmUid(cfg.dmUid ? String(cfg.dmUid) : '')
         if (cfg && dmWatch === null) setDmWatch(cfg.dmWatch !== false)   // 2.0 起默认开
         if (cfg && favId === null) setFavId(String(cfg.favFolderId ?? 0))
         if (cfg && excl === null) setExcl((cfg.excludeWords || []).join('\n'))
@@ -379,15 +447,19 @@ function WatchTab() {
           .catch(() => { if (alive.current) setWsList([]) })
       }, [wsList])
 
-      // ⭐ 2026-11-09（工单 06）：队列现状 —— 条数变了就重读一次（/status 是 5 秒轮询，别每跳都拉）
+      /* ⭐ 2026-11 工单 10：队列现状 —— **随 /status 每 5 秒的轮询一起刷新**（不是只在打开时读一次），
+       *    另外手动投递 / 手动采集之后用 queueNonce 立刻再读一次（不然要等 5 秒才看见队头变了）。
+       *    只读本地文件，很便宜；读不到就退成空列表，面板自己会说"队列是空的"。 */
       React.useEffect(() => {
-        jget('/queue').then((r) => { if (alive.current) setQueue(r && r.ok ? r : { items: [] }) })
-          .catch(() => { if (alive.current) setQueue({ items: [] }) })
-      }, [st?.queuePending, st?.queueTotal, st?.queueDroppedLast])
+        jget('/queue').then((r) => { if (alive.current) setQueue(r && r.ok ? r : { items: [], finished: [] }) })
+          .catch(() => { if (alive.current) setQueue({ items: [], finished: [] }) })
+      }, [st, queueNonce])
 
+      /* ⭐ 2026-10-28：所有提示都走顶部那条吸顶的 msgbar（`say` 一处收口）——
+       *    以前每条反馈都写在自己那一节的底部，往下滚到某个开关就看不见了（他报「绿字没了」）。
+       *    ⚠️ 工单 10 重排后 msg 仍是**唯一**的提示出口：别在别处再塞一份，否则两处会不同步。 */
       const say = (text, tone) => {
         setMsg(text); setMsgTone(tone || '')
-        setRunNote(text ? { t: text, tone: tone || '' } : null)   // ⭐ 同时镜像到顶部，免得提示掉到页面最底下看不见
       }
 
       const patch = async (p, what) => {
@@ -406,6 +478,46 @@ function WatchTab() {
         } catch (e) { say(String(e?.message ?? e), 'warn') }
         // 不管成功失败都清掉乐观值：成功时以服务端返回为准，失败时自动回到原样
         finally { setOptim({}); setBusy('') }
+      }
+
+      /* ── 工单 10：新设置项的「本地草稿 → 钳制 → patch」 ──
+       *  · 范围数字与宿主 clampPatch **同一把尺子**（那边是权威；改上限要两边一起改）。
+       *  · 草稿优先，没动过的项直接显示服务端那份 —— 用户改了但没失焦时不会被 5 秒轮询冲掉。 */
+      const NUM_SPEC = {
+        collectBatch: { def: 3, min: 1, max: 10 },              // lib/queue.mjs COLLECT_BATCH
+        queueLimit: { def: 3, min: 1, max: 20 },                // lib/queue.mjs QUEUE_LIMIT
+        queueTtlHours: { def: 24, min: 1, max: 168 },           // lib/queue.mjs QUEUE_TTL_HOURS
+        deliverPerDay: { def: 5, min: 0, max: 50 },
+        deliverMinGapMin: { def: 45, min: 0, max: 1440 },
+        deliverMaxGapMin: { def: 120, min: 0, max: 1440 },
+        deliverRetries: { def: 1, min: 0, max: 3 },
+      }
+      const draftOf = (k) => (k in drafts ? drafts[k] : String(cfg[k] ?? ''))
+      const setDraft = (k, v) => setDrafts((old) => ({ ...old, [k]: v }))
+      const numIn = (v, spec) => {
+        const n = Math.floor(Number(v))
+        if (!Number.isFinite(n)) return spec.def
+        return Math.max(spec.min, Math.min(n, spec.max))
+      }
+      const commitNum = (k, what) => {
+        const n = numIn(k in drafts ? drafts[k] : cfg[k], NUM_SPEC[k])
+        setDraft(k, String(n))                      // 输入框当场收敛到合法值（和失焦钳制一个效果）
+        patch({ [k]: n }, what)
+      }
+      /* 两条之间的间隔：前端也要满足「最短 ≤ 最长」—— 用户把最长写小了就把最长抬到最短
+       * （和宿主 clampPatch 的取舍完全一致：宁可间隔变长，也不出现「最长 < 最短」的区间）。 */
+      const commitGap = (which) => {
+        const min = numIn('deliverMinGapMin' in drafts ? drafts.deliverMinGapMin : cfg.deliverMinGapMin, NUM_SPEC.deliverMinGapMin)
+        const max = numIn('deliverMaxGapMin' in drafts ? drafts.deliverMaxGapMin : cfg.deliverMaxGapMin, NUM_SPEC.deliverMaxGapMin)
+        const fixedMax = Math.max(min, max)
+        setDrafts((old) => ({ ...old, deliverMinGapMin: String(min), deliverMaxGapMin: String(fixedMax) }))
+        patch({ deliverMinGapMin: min, deliverMaxGapMin: fixedMax }, which === 'min' ? '两条之间的最短间隔' : '两条之间的最长间隔')
+      }
+      /* 免打扰起止：只提交合法 HH:MM（写坏了/清空了就退回保存值 —— 宿主那边也会再钳一次）。 */
+      const commitClock = (k, what) => {
+        const raw = String((k in drafts ? drafts[k] : cfg[k]) ?? '').trim()
+        if (!/^([01]?\d|2[0-3]):[0-5]\d$/.test(raw)) { setDraft(k, String(cfg[k] ?? '')); return }
+        patch({ [k]: raw }, what)
       }
 
       // 「它刷过的视频」：点开才读，读一次就留着（不会每 5 秒重拉）
@@ -556,7 +668,7 @@ function WatchTab() {
               + (r?.queueFullHint ? '。⚠️ ' + r.queueFullHint : ''), r?.queueFullHint ? 'warn' : 'good')
           } else say(r?.error || '没起来，看 duty.log', 'warn')
         } catch (e) { say(String(e?.message ?? e), 'warn') }
-        finally { setBusy('') }
+        finally { setBusy(''); setQueueNonce((n) => n + 1) }   // 工单 10：按钮点完立刻重读队列摘要
       }
 
       // ⭐ 工单 09：「现在投递」—— 立刻发队头一条（宿主侧手动投递：不看间隔 / 免打扰 / 当日额度）
@@ -567,7 +679,7 @@ function WatchTab() {
           const msg = String(r?.message || (r?.sent ? '已投递' : '没发成'))
           say(msg, r?.sent ? 'good' : 'warn')
         } catch (e) { say(String(e?.message ?? e), 'warn') }
-        finally { setBusy('') }
+        finally { setBusy(''); setQueueNonce((n) => n + 1) }   // 工单 10：投完立刻重读队列（队头已经变了）
       }
 
       // ⭐ 工单 09：采集时间点（一行一个 HH:MM）；清洗 / 排序 / 去重 / 最多 12 个都由宿主做，
@@ -665,6 +777,12 @@ function WatchTab() {
       const sw = (k) => Boolean(k in optim ? optim[k] : cfg[k])
       // ⭐ 工单 08：人设留空 ⇒ 公开评论不可用（置灰 + 说原因；**不改用户存的值**，行为和 UI 按不可用处理）
       const personaMissing = Boolean(st && st.personaPresent === false)
+      /* ⭐ 工单 10：「公开评论」能不能用**只看宿主**（/status.commentAvailable / commentBlockedReason）——
+       *    不能只看 channelComment（那只是"用户存的开关"，人设空着时存着开也不会发）。
+       *    老宿主没有这两个字段时退回 personaPresent 的判断，别把开关一律置灰。 */
+      const commentAvailable = st?.commentAvailable !== false && !personaMissing
+      const personaNote = String(st?.commentBlockedReason || '')
+        || (personaMissing ? '人设提示词是空的' : '人设提示词读不到')
 
       /* ⭐ 2026-10-23：模型下拉 —— 值用 `provider|model` 拼成一个字符串，
        *    这样「跟随当前会话」（空值）和"钉死某一个"用同一个 select 就能表达。 */
@@ -715,52 +833,98 @@ function WatchTab() {
             ? '刚点过，再等 ' + deliverCooldownSec + ' 秒'
             : '立刻发队头一条：不看间隔与免打扰、不占当天额度'
       const nextCollectText = st?.nextCollectAt
-        ? '下一次采集：' + new Date(st.nextCollectAt).toLocaleString('zh-CN')
+        ? '下一次采集：' + fmtTime(st.nextCollectAt)
         : '还没有下一次采集（时间点空着 ⇒ 只能手动跑）'
+      /* ⭐ 工单 10：采集按钮的可点状态与提示（和投递按钮分开：一个看 running，一个看队列/渠道/冷却） */
+      const collectDisabled = Boolean(busy) || Boolean(st.running) || collectCooldownMin > 0
+      const collectTitle = st.running
+        ? '上一轮还没跑完；卡住了会在 ' + (st.runTimeoutMinutes || 20) + ' 分钟时自动收掉'
+        : collectCooldownMin > 0
+          ? '刚点过，再等约 ' + collectCooldownMin + ' 分钟'
+          : (st.queueFullHint ? '⚠️ ' + st.queueFullHint + '（手动跑仍然可以）' : '立刻跑一轮采集：不看时间点与水位闸')
+      /* ⭐ 工单 10：「今天」那一块的数字 —— 口径全由宿主给（基线那天 = 基线 + 账本，见 /status）。 */
+      const deliverPerDayCfg = Number(cfg.deliverPerDay) || 0
+      const deliveredToday = Number(st.deliveredToday) || 0
+      const queuePendingN = Number(st.queuePending) || 0
+      const queueLimitN = Number(cfg.queueLimit) || Number(st.queueLimit) || 3
+      const lastDelivery = st.lastDelivery || null
+      const lastDeliveryText = lastDelivery
+        ? '最后一条投递：' + fmtTime(lastDelivery.at)
+          + (lastDelivery.bvid ? ' · ' + lastDelivery.bvid : '')
+          + (LEDGER_STATUS_TEXT[lastDelivery.status] ? ' · ' + LEDGER_STATUS_TEXT[lastDelivery.status] : '')
+          + (lastDelivery.manual ? '（手动，不占额度）' : '')
+        : '还没有投递记录'
+      const noticeItems = (Array.isArray(st.notifications) ? st.notifications : []).slice(0, 3)
+      /* 队列面板：待投递（queue.items）+ 最近结束的（queue.finished：已投递 / 已过期 / 投递失败）。
+       * ⚠️ 私信关着时宿主不会把 pending 放进 items（"有货但不会发"的错觉），finished 照常给 —— 那是历史。 */
+      const queueItems = Array.isArray(queue?.items) ? queue.items : []
+      const queueFinished = Array.isArray(queue?.finished) ? queue.finished : []
+      const queueRows = [...queueItems, ...queueFinished]
+      const queueTtlText = (x) => {
+        const status = String(x.status || 'pending')
+        if (status === 'pending') {
+          const left = x.expiresInHours === null || x.expiresInHours === undefined ? null : Number(x.expiresInHours)
+          if (left === null || !Number.isFinite(left)) return '没有保质期'
+          if (left >= 1) return '还能放 ' + Math.round(left) + ' 小时'
+          return '还能放 ' + Math.max(0, Math.round(left * 60)) + ' 分钟'
+        }
+        if (status === 'sent') return '已经发给你了'
+        if (status === 'expired') return '过期作废（不通知）'
+        return Number(x.attempts) > 0 ? '试了 ' + Number(x.attempts) + ' 次也没发出去' : '没发出去'
+      }
+      const queueRow = (x) => {
+        const status = String(x.status || 'pending')
+        return h('div', { key: x.id || x.bvid, 'data-bd-qrow': '' },
+          h('div', { 'data-bd-qrow-t': '' }, x.title || x.bvid),
+          h('div', { 'data-bd-row': '' },
+            h('span', { 'data-bd-qstat': status }, QUEUE_STATUS_TEXT[status] || status),
+            h('span', { 'data-bd-qrow-n': '' },
+              x.bvid + (x.up ? ' · ' + x.up : '') + ' · 采集于 ' + fmtTime(x.collectedAt)),
+            h('span', { 'data-bd-qrow-n': '' }, queueTtlText(x))),
+          (status === 'failed' && x.lastError)
+            ? h('div', { 'data-bd-qrow-n': '' }, '失败原因：' + x.lastError)
+            : null,
+          (status === 'pending' && Number(x.attempts) > 0)
+            ? h('div', { 'data-bd-qrow-n': '' },
+              '已经试过 ' + Number(x.attempts) + ' 次'
+              + (x.retryAt && Date.parse(x.retryAt) > Date.now() ? '，' + fmtTime(x.retryAt) + ' 之后重试' : ''))
+            : null)
+      }
 
       return h('div', { 'data-bd-page': '' },
 
-        /* ── 今天 ── */
+        /* ── 顶部：提示（吸顶）+ 状态徽章 + 页签 + 保存 ──
+         * ⭐ 2026-11 工单 10：提示**只从这里出**（say() 收口）—— 以前各节底部各有一份 msg，
+         *    重排后容易两处不同步，也容易漏掉。吸顶条沿用 2026-10-28 那次的形状。 */
+        msg ? h('div', {
+          'data-bd-msg': '', 'data-bd-msgbar': '',
+          'data-good': msgTone === 'good' ? '' : undefined,
+          'data-warn': msgTone === 'warn' ? '' : undefined,
+        }, msg) : null,
+
         h('div', { 'data-bd-row': '' },
-          h('span', { 'data-bd-badge': '' }, `自动已挑 ${st.autoPicked ?? st.pickedToday ?? 0} / ${cfg.perDay} 条` + ((st.manualExtra > 0) ? ` · 手动 ${st.manualExtra} 条` : '')),
+          h('span', { 'data-bd-badge': '' }, `今天已挑 ${st.autoPicked ?? st.pickedToday ?? 0} / ${cfg.perDay} 条` + ((st.manualExtra > 0) ? ` · 手动 ${st.manualExtra} 条` : '')),
           h('span', { 'data-bd-badge': '' }, '环境' + (st.venvReady ? '已就绪' : (st.installing ? '正在装' : '未装'))),
           h('span', { 'data-bd-badge': '' }, st.loggedIn ? 'B站已登录' : 'B站未登录'),
-            h('span', { 'data-bd-badge': '' }, 'v' + (st.version || '?')),
+          h('span', { 'data-bd-badge': '' }, 'v' + (st.version || '?')),
           // ⭐ 2026-10-23：正在跑的时候把"跑了多久"摆出来 —— 以前连点两次会并行两轮，现在宿主会挡
-          st.running ? h('span', { 'data-bd-badge': '' }, '正在跑 ' + runMinutes + ' 分钟') : null,
-          h('div', { 'data-bd-grow': '' }),
-          // ⭐ 工单 09：两个手动入口拆开 —— 「现在跑一轮采集」看 running；「现在投递」看队列 / 私信 / 防连点
-          h('button', {
-            'data-bd-btn': '', disabled: busy === 'run' || Boolean(st.running) || collectCooldownMin > 0,
-            title: st.running ? '上一轮还没跑完；卡住了会在 ' + (st.runTimeoutMinutes || 20) + ' 分钟时自动收掉'
-              : (collectCooldownMin > 0 ? '刚点过，再等约 ' + collectCooldownMin + ' 分钟' : '立刻跑一轮采集：不看时间点与水位闸'),
-            onClick: onRun,
-          }, st.running ? '采集中…' : '现在跑一轮采集'),
-          h('button', {
-            'data-bd-btn': '', disabled: deliverDisabled,
-            title: deliverTitle,
-            onClick: onDeliver,
-          }, busy === 'deliver' ? '投递中…' : '现在投递')),
-          runNote ? h('div', { 'data-bd-msg': '', 'data-good': runNote.tone === 'good' ? '' : undefined,
-            'data-warn': runNote.tone === 'warn' ? '' : undefined }, runNote.t) : null,
+          st.running ? h('span', { 'data-bd-badge': '' }, '正在采集 ' + runMinutes + ' 分钟') : null),
 
-
-        /* ── 定时 ── */
         h('div', { 'data-bd-tabs': '' },
           [['daily', '日常'], ['taste', '偏好'], ['social', '互动'], ['adv', '高级']].map(([v, label]) =>
             h('button', { key: v, 'data-bd-tab': '', 'aria-selected': tab === v ? 'true' : 'false', onClick: () => setTab(v) }, label))),
 
         h('div', { 'data-bd-row': '' },
-          h('button', { 'data-bd-btn': '', 'data-primary': '', disabled: Boolean(busy), onClick: onSaveText }, '保存')),
+          h('button', { 'data-bd-btn': '', 'data-primary': '', disabled: Boolean(busy), onClick: onSaveText }, '保存'),
+          h('div', { 'data-bd-note': '' },
+            '「保存」存的是口味 / 人设 / 评论那几项文字设置；采集与投递的数字改完失焦就生效，都不用重启。')),
 
+        /* ══════════════ 日常 · 一、它什么时候采集 ══════════════ */
         h('div', { 'data-bd-sec': '', 'data-bd-group': 'daily', 'data-bd-away': tab === 'daily' ? undefined : '' },
-          h('div', { 'data-bd-h': '' }, '什么时候自己跑'),
-          h('div', { 'data-bd-row': '' },
-            h('div', { 'data-bd-grow': '' },
-              h('div', { 'data-bd-label': '' }, '采集时间点'),
-              h('div', { 'data-bd-note': '' },
-                '一行一个 HH:MM（本机时间，最多 12 个）；到点跑一轮采集，错过的时点不补跑。'
-                + '留空 = 只手动跑。'))),
+          h('div', { 'data-bd-h': '' }, '它什么时候采集'),
+          h('div', { 'data-bd-label': '' }, '采集时间点'),
+          h('div', { 'data-bd-note': '' },
+            '一行一个 HH:MM（本机时间，最多 12 个）；到点跑一轮采集，错过的时点不补跑。留空 = 只手动跑。'),
           h('textarea', {
             'data-bd-input': '', rows: 4,
             placeholder: '12:30\n19:30',
@@ -768,51 +932,416 @@ function WatchTab() {
             onChange: (e) => setCollectTimes(e.target.value),
             onBlur: () => { saveCollectTimes() },
           }),
-          h('div', { 'data-bd-note': '' }, nextCollectText
-            + (Number(st?.queuePending) > 0 ? ' · 队列里 ' + Number(st.queuePending) + ' 条待投递' : ' · 队列是空的')),
+          h('div', { 'data-bd-note': '' }, nextCollectText),
           st?.lastCollectAt
-            ? h('div', { 'data-bd-note': '' }, '上次采集：' + new Date(st.lastCollectAt).toLocaleString('zh-CN')
+            ? h('div', { 'data-bd-note': '' }, '上次采集：' + fmtTime(st.lastCollectAt)
               + (collectCooldownMin > 0 ? ' · 手动冷却还剩约 ' + collectCooldownMin + ' 分钟' : ''))
-            : null),
+            : h('div', { 'data-bd-note': '' }, '还没采集过 —— 到第一个时间点会自动跑，也可以点「今天」里的按钮。'),
+          h(NumRow, {
+            label: '每次采几条',
+            note: '一轮最多采几条（1–10）。采集轮只挑候选、写好草稿，不发出去。',
+            value: draftOf('collectBatch'), min: 1, max: 10,
+            onChange: (v) => setDraft('collectBatch', v),
+            onBlur: () => commitNum('collectBatch', '每次采几条'),
+          }),
+          h(NumRow, {
+            label: '队列上限',
+            note: '队列最多攒几条（1–20）。队列满了就跳过这一轮（水位闸）；点「现在跑一轮采集」仍然可以跑。',
+            value: draftOf('queueLimit'), min: 1, max: 20,
+            onChange: (v) => setDraft('queueLimit', v),
+            onBlur: () => commitNum('queueLimit', '队列上限'),
+          }),
+          st?.queueFullHint
+            ? h('div', { 'data-bd-msg': '', 'data-warn': '' },
+              st.queueFullHint + ' —— 到点的采集轮会跳过，等投递掉几条再说；手动跑仍然可以。') : null),
 
-        /* ── 一轮挑几条 ── */
+        /* ══════════════ 日常 · 二、它怎么发给你 ══════════════
+         * ⚠️ 旧的 peakValley / noon / night / dmMode / autoComment 只作为配置兼容与迁移来源留在
+         *    index.js 的 DEFAULTS 里（迁移见 lib/channels.mjs）—— **界面上不再有任何入口**，
+         *    别再给它们加开关：行为只看 channelDm / channelComment / collectTimes / 投递那几个数。 */
         h('div', { 'data-bd-sec': '', 'data-bd-group': 'daily', 'data-bd-away': tab === 'daily' ? undefined : '' },
-          h('div', { 'data-bd-h': '' }, '一轮挑几条'),
+          h('div', { 'data-bd-h': '' }, '它怎么发给你'),
+          h(ToggleRow, {
+            label: '私信发给我',
+            note: '默认开。采集轮只把候选攒进队列，宿主按下面的节奏一条一条私信发给你。关掉 = 不建队列、不投递。',
+            on: sw('channelDm'),
+            onChange: (v) => patch({ channelDm: v }, '私信'),
+          }),
+          sw('channelDm')
+            ? h('div', { 'data-bd-sub': '' },
+              h(NumRow, {
+                label: '每天最多发几条',
+                note: '0 = 不自动投递（「现在投递」仍然可用，且不占当天额度）。0–50。',
+                value: draftOf('deliverPerDay'), min: 0, max: 50,
+                onChange: (v) => setDraft('deliverPerDay', v),
+                onBlur: () => commitNum('deliverPerDay', '每天最多发几条'),
+              }),
+              h('div', { 'data-bd-label': '' }, '两条之间隔多久'),
+              h('div', { 'data-bd-note': '' }, '在这个区间里随机挑一个间隔 —— 像人，不像推送机。单位是分钟，0–1440。'),
+              h(NumRow, {
+                label: '最短间隔（分钟）',
+                note: '不能比最长还大（保存时会把最长一起抬上来）',
+                value: draftOf('deliverMinGapMin'), min: 0, max: 1440,
+                onChange: (v) => setDraft('deliverMinGapMin', v),
+                onBlur: () => commitGap('min'),
+              }),
+              h(NumRow, {
+                label: '最长间隔（分钟）',
+                note: '必须 ≥ 最短；写小了会自动抬到最短那一边',
+                value: draftOf('deliverMaxGapMin'), min: 0, max: 1440,
+                onChange: (v) => setDraft('deliverMaxGapMin', v),
+                onBlur: () => commitGap('max'),
+              }),
+              h('div', { 'data-bd-label': '' }, '免打扰时段'),
+              h('div', { 'data-bd-note': '' },
+                '这段时间里不投递（采集不受影响）。可以跨零点，比如 23:00 → 08:00；'
+                + '起止填成一样 = 不设免打扰。'),
+              h(ClockRow, {
+                label: '从（含）',
+                note: '免打扰开始',
+                value: draftOf('quietStart'),
+                onChange: (v) => setDraft('quietStart', v),
+                onBlur: () => commitClock('quietStart', '免打扰开始'),
+              }),
+              h(ClockRow, {
+                label: '到（不含）',
+                note: '免打扰结束',
+                value: draftOf('quietEnd'),
+                onChange: (v) => setDraft('quietEnd', v),
+                onBlur: () => commitClock('quietEnd', '免打扰结束'),
+              }),
+              h(NumRow, {
+                label: '候选的保质期（小时）',
+                note: '采到超过这么久还没发出去的，直接作废（作废不通知）。1–168。',
+                value: draftOf('queueTtlHours'), min: 1, max: 168,
+                onChange: (v) => setDraft('queueTtlHours', v),
+                onBlur: () => commitNum('queueTtlHours', '候选保质期'),
+              }),
+              h(NumRow, {
+                label: '发失败重试几次',
+                note: '每次失败等 5 分钟再试；试满就放弃这一条、继续下一条。0–3。',
+                value: draftOf('deliverRetries'), min: 0, max: 3,
+                onChange: (v) => setDraft('deliverRetries', v),
+                onBlur: () => commitNum('deliverRetries', '失败重试次数'),
+              }),
+              h(ToggleRow, {
+                label: '出故障时通知我',
+                note: '只在「采集失败 / 连续投递失败」时说话；「没找到」和「过期作废」永远不打扰。关掉 = 一条通知都不发。',
+                on: sw('notifyOnFailure'),
+                onChange: (v) => patch({ notifyOnFailure: v }, '故障通知'),
+              }))
+            : h('div', { 'data-bd-msg': '' },
+              '私信关着 ⇒ 不建队列、不投递。采集轮只把候选写进日报；公开评论在「互动」里单独开关。')),
+
+        /* ══════════════ 日常 · 三、今天 ══════════════ */
+        h('div', { 'data-bd-sec': '', 'data-bd-group': 'daily', 'data-bd-away': tab === 'daily' ? undefined : '' },
+          h('div', { 'data-bd-h': '' }, '今天'),
           h('div', { 'data-bd-row': '' },
-            h('div', { 'data-bd-grow': '' },
-              h('div', { 'data-bd-label': '' }, '每天最多挑几条'),
-              h('div', { 'data-bd-note': '' }, '填 0 = 不自动刷（还是能手动跑）')),
-            h('input', {
-              'data-bd-input': '', 'data-bd-num': '', type: 'number', min: 0, max: 50,
-              value: perDay ?? '',
-              onChange: (e) => setPerDay(e.target.value),
-              onBlur: () => { const n = Math.max(0, Math.min(Number(perDay) || 0, 50)); setPerDay(String(n)); patch({ perDay: n }, '每天挑几条') },
-            })),
-          st.lastRunAt ? h('div', { 'data-bd-note': '' }, `上次跑：${new Date(st.lastRunAt).toLocaleString('zh-CN')}`) : null),
+            h('span', { 'data-bd-badge': '' },
+              '已投递 ' + deliveredToday + ' / ' + deliverPerDayCfg + ' 条'
+              + (deliverPerDayCfg === 0 ? '（上限 0 = 不自动投递）' : '')),
+            h('span', { 'data-bd-badge': '' }, '队列 ' + queuePendingN + ' 条待投递'),
+            h('span', { 'data-bd-note': '' }, lastDeliveryText)),
+          h('div', { 'data-bd-row': '' },
+            h('button', {
+              'data-bd-btn': '', disabled: collectDisabled, title: collectTitle, onClick: onRun,
+            }, st.running ? '采集中…' : '现在跑一轮采集'),
+            h('button', {
+              'data-bd-btn': '', disabled: deliverDisabled, title: deliverTitle, onClick: onDeliver,
+            }, busy === 'deliver' ? '投递中…' : '现在投递'),
+            h('div', { 'data-bd-note': '' },
+              '手动采集不看时间点与水位闸（有冷却）；手动投递不看间隔与免打扰，也不占当天额度。')),
+          deliverCooldownSec > 0
+            ? h('div', { 'data-bd-note': '' }, '「现在投递」刚点过 —— 再等 ' + deliverCooldownSec + ' 秒才能再点。')
+            : null,
 
-        /* ── 队列（工单 06）：采集轮攒下来的候选 ──（10 会把它挪到「今天」那块；先保证能看见） */
-        h('div', { 'data-bd-sec': '', 'data-bd-group': 'daily', 'data-bd-away': tab === 'daily' ? undefined : '' },
-          h('div', { 'data-bd-h': '' }, '队列（等着发给你的候选）'),
+          /* 最近通知：空着就整块不显示（spec「只在故障时说话」） */
+          noticeItems.length
+            ? h('div', { 'data-bd-sub': '' },
+              h('div', { 'data-bd-label': '' }, '最近通知'),
+              ...noticeItems.map((n, i) => h('div', { key: String(n.at || '') + i, 'data-bd-note': '' },
+                fmtTime(n.at) + ' · ' + (NOTIFY_KIND_TEXT[n.kind] || n.kind) + (n.message ? ' · ' + n.message : ''))),
+              sw('notifyOnFailure')
+                ? null
+                : h('div', { 'data-bd-note': '' }, '（故障通知现在关着 —— 上面的历史还在，但不会再有新的）'))
+            : null,
+
+          /* 队列面板：逐条 BV / 标题 / 采集时间 / 剩余保质期 / 状态（失败带原因）。
+           * 数据来自 GET /api/bili-duty/queue，随 /status 轮询刷新（见上面那个 useEffect）。 */
+          h('div', { 'data-bd-label': '' }, '队列'),
           h('div', { 'data-bd-note': '' },
             queue === null
               ? '读取中…'
-              : (Number(st?.queuePending) || 0) + ' 条待投递'
-                + (Number(st?.queueLimit) ? ' · 上限 ' + Number(st.queueLimit) + ' 条' : '')
-                + (st?.queueNext ? ' · 下一条：' + st.queueNext.title : '')),
-          queue && Array.isArray(queue.items) && queue.items.length
-            ? h('div', { 'data-bd-list': '' }, queue.items.map((x) => h('div', { key: x.id, 'data-bd-item': '' },
-                h('div', { 'data-bd-item-body': '' },
-                  h('div', { 'data-bd-item-t': '' }, x.title || x.bvid),
-                  h('div', { 'data-bd-item-n': '' },
-                    x.bvid + ' · ' + (x.up || '未知 UP')
-                    + ' · 还能放 ' + Math.max(0, Math.round(Number(x.expiresInHours) || 0)) + ' 小时')))))
-            : h('div', { 'data-bd-note': '' }, queue === null ? '' : '队列是空的 —— 采集轮挑到候选后会攒在这儿'),
+              : !sw('channelDm')
+                ? (queue.pausedReason || '私信关着 ⇒ 不建队列、不投递')
+                : queueRows.length
+                  ? queuePendingN + ' 条待投递'
+                    + (queueFinished.length ? ' · 最近结束的 ' + queueFinished.length + ' 条也在下面' : '')
+                  : '队列是空的 —— 到采集时间点会自动采，或点上面的按钮'),
+          queueRows.length ? h('div', { 'data-bd-qlist': '' }, queueRows.map((x) => queueRow(x))) : null,
           Number(st?.queueDroppedLast) > 0
             ? h('div', { 'data-bd-note': '' }, '上一轮队列满了，有 ' + Number(st.queueDroppedLast) + ' 条没进来（上限 '
-              + (Number(st.queueLimit) || 3) + ' 条）—— 详情在今天的日报「队列」一节')
+              + queueLimitN + ' 条）—— 详情在今天的日报「队列」一节')
             : null),
 
-        /* ── 用哪个模型跑 ──（⭐ 2026-11-04：挪到「高级」—— 它装的时候定一次就好，不是每天会动的东西；摆在「日常」里会让人以为要天天调） */
+        /* ── 它刷过的视频（历史）：从旧的「日常」里原样留下 —— 它不是这次重排的三块之一，
+         *    但一直是设置页的正式入口（会话头也有同名 tab），不能弄丢。 ── */
+        h('div', { 'data-bd-sec': '', 'data-bd-group': 'daily', 'data-bd-away': tab === 'daily' ? undefined : '' },
+          h('div', { 'data-bd-h': '' }, '它刷过的视频（历史）'),
+          h('div', { 'data-bd-row': '' },
+            h('button', { 'data-bd-btn': '', disabled: busy === 'watched', onClick: () => (watchedRows !== null ? setWatchedRows(null) : onLoadWatched(watchedState, watchedTier, watchedOffset)) },
+              watchedRows !== null ? '收起' : '看它刷过什么'),
+            h('div', { 'data-bd-note': '' },
+              watchedRows === null ? '（点一下读出来；数据来自判重表 seen.md + 报告里的档位）'
+                : (watchedTotal ? `共 ${watchedTotal} 条` : '这一类还没有记录 —— 跑一轮之后就有了'))),
+          watchedRows !== null ? h('div', { 'data-bd-row': '' },
+            [['', '全部'], ['picked', '挑了'], ['skipped', '跳过'], ['commented', '发给你了']].map(([v, label]) =>
+              h('button', { key: v || 'all', 'data-bd-chip': '', 'aria-selected': watchedState === v ? 'true' : 'false', onClick: () => onWatchPick('state', v) }, label)),
+            ['值得看', '可以看', '不值当'].map((v) =>
+              h('button', { key: v, 'data-bd-chip': '', 'aria-selected': watchedTier === v ? 'true' : 'false', onClick: () => onWatchPick('tier', v) }, v))) : null,
+          watchedRows !== null && watchedRows.length ? h('div', { 'data-bd-list': '' },
+            watchedRows.map((x, i) => h('div', { key: x.day + x.bvid, 'data-bd-item': '' },
+              // 封面走宿主代理（直连 i0.hdslb.com 会被防盗链挡，也等于把使用者 IP 交出去）
+              i < 40 ? h('img', { 'data-bd-cover': '', src: API + '/cover?bv=' + x.bvid, loading: 'lazy', alt: '' }) : null,
+              h('div', { 'data-bd-item-body': '' },
+                h('div', { 'data-bd-item-t': '' },
+                  h('a', { href: x.url, target: '_blank', rel: 'noreferrer' }, x.title)),
+                h('div', { 'data-bd-item-n': '' },
+                  `${x.day} · ${x.up} · `, x.picked ? '挑中了' : '跳过', (x.delivered || x.commented) ? ' · 已发给你' : '',
+                  x.tier ? h('span', { 'data-bd-tier': x.tier }, ' · ' + x.tier) : null),
+                x.why ? h('div', { 'data-bd-item-why': '' }, x.why) : null))))
+            : null,
+          watchedRows !== null && watchedTotal > WATCH_PAGE ? h('div', { 'data-bd-row': '' },
+            h('button', { 'data-bd-btn': '', disabled: watchedOffset <= 0, onClick: () => onWatchPage(-WATCH_PAGE) }, '上一页'),
+            h('div', { 'data-bd-note': '' }, `${watchedOffset + 1}–${Math.min(watchedOffset + WATCH_PAGE, watchedTotal)} / ${watchedTotal}`),
+            h('button', { 'data-bd-btn': '', disabled: watchedOffset + WATCH_PAGE >= watchedTotal, onClick: () => onWatchPage(WATCH_PAGE) }, '下一页')) : null),
+
+        /* ══════════════ 互动 · 发给谁 / 公开评论 / 私信双向 ══════════════
+         * ⭐ 工单 10：「公开评论」从「日常」挪到这儿，并和人设绑定 —— 人设为空时置灰 + 说原因
+         *    （判据用 /status.commentAvailable / commentBlockedReason，不是只看 channelComment）。 */
+        h('div', { 'data-bd-sec': '', 'data-bd-group': 'social', 'data-bd-away': tab === 'social' ? undefined : '' },
+          h('div', { 'data-bd-h': '' }, '发给谁 / @ 谁'),
+          h('div', { 'data-bd-label': '' }, 'B站 昵称'),
+          h('input', {
+            'data-bd-input': '', value: mention ?? '',
+            placeholder: '填你自己的 B站 昵称；私信按它查 UID，评论也 @ 它',
+            onChange: (e) => setMention(e.target.value),
+            onBlur: () => { const v = String(mention || '').trim(); setMention(v); patch({ mentionName: v }, '发给谁') },
+          }),
+          sw('channelDm') ? h('div', { 'data-bd-note': '' }, '私信会发给他（用昵称自动查一次 UID；查不到就先攒着，不会一条都不送）。⚠️ 建议先让这个号和收件人互关：B站 对「陌生人私信」会限流，还可能不弹提醒。') : null),
+
+        h('div', { 'data-bd-sec': '', 'data-bd-group': 'social', 'data-bd-away': tab === 'social' ? undefined : '' },
+          h('div', { 'data-bd-h': '' }, '公开评论（在视频下 @ 我）'),
+          h(ToggleRow, {
+            label: '在视频下公开评论 @ 我',
+            note: commentAvailable
+              ? '默认关。公开，别人也看得见；每条评论里 @ 一次上面那个人。'
+              : '置灰：' + personaNote + '。人设留空时它不公开说话。',
+            on: sw('channelComment'),
+            disabled: !commentAvailable,
+            onChange: (v) => patch({ channelComment: v }, '公开评论'),
+          }),
+          !commentAvailable ? h('div', { 'data-bd-msg': '' },
+            '为什么置灰：' + personaNote + '。想让它在视频下说话，先在「偏好 → 它按什么说话（人设提示词）」里写一段，或填一个文件路径。') : null,
+          (!commentAvailable && sw('channelComment')) ? h('div', { 'data-bd-msg': '', 'data-warn': '' },
+            '「公开评论」存着是开，但现在不会发：' + personaNote) : null,
+          (commentAvailable && sw('channelComment')) ? h('div', { 'data-bd-sub': '' },
+            h('div', { 'data-bd-row': '' },
+              h('div', { 'data-bd-grow': '' },
+                h('div', { 'data-bd-label': '' }, '每轮最多发几条评论'),
+                h('div', { 'data-bd-note': '' }, '每条评论里 @ 一次上面那个人；填 0 = 这一轮不发评论')),
+              h('input', {
+                'data-bd-input': '', 'data-bd-num': '', type: 'number', min: 0, max: 20,
+                value: perRound ?? '',
+                onChange: (e) => setPerRound(e.target.value),
+                onBlur: () => { const n = Math.max(0, Math.min(Number(perRound) || 0, 20)); setPerRound(String(n)); patch({ commentPerRound: n }, '每轮发几条评论') },
+              })),
+            h('div', { 'data-bd-row': '' },
+              h('div', { 'data-bd-grow': '' },
+                h('div', { 'data-bd-label': '' }, '评论写多长'),
+                h('div', { 'data-bd-note': '' }, '短 ≤15 字 · 中 ≤40 字 · 长 ≤100 字（默认中）')),
+              h('select', {
+                'data-bd-input': '', value: cLen ?? 'medium',
+                onChange: (e) => { setCLen(e.target.value); patch({ commentLength: e.target.value }, '评论长度') },
+              },
+                h('option', { value: 'short' }, '短'),
+                h('option', { value: 'medium' }, '中'),
+                h('option', { value: 'long' }, '长'))),
+            h(ToggleRow, {
+              label: '回复评论（只回楼中楼）',
+              note: '开了之后它只回「直接回复到你那条评论下面的人」，不参与讨论',
+              on: sw('replyToComments'),
+              onChange: (v) => patch({ replyToComments: v }, '回复评论'),
+            }),
+            sw('replyToComments') ? h('div', { 'data-bd-sub': '' },
+              h('div', { 'data-bd-row': '' },
+                h('div', { 'data-bd-grow': '' },
+                  h('div', { 'data-bd-label': '' }, '每轮最多回几条'),
+                  h('div', { 'data-bd-note': '' }, '只回直接回在你那条评论下面的人')),
+                h('input', {
+                  'data-bd-input': '', 'data-bd-num': '', type: 'number', min: 1, max: 10,
+                  value: replyPer ?? '',
+                  onChange: (e) => setReplyPer(e.target.value),
+                  onBlur: () => { const n = Math.max(1, Math.min(Number(replyPer) || 1, 10)); setReplyPer(String(n)); patch({ replyPerRound: n }, '每轮回几条') },
+                }))) : null) : null),
+
+        h('div', { 'data-bd-sec': '', 'data-bd-group': 'social', 'data-bd-away': tab === 'social' ? undefined : '' },
+          h('div', { 'data-bd-h': '' }, '私信双向'),
+          h(ToggleRow, {
+            label: '私信双向（有人私信它就回一句）',
+            note: '默认开。你在 B站 私信里跟它说话，它会回你（陌生人的私信不回）。⭐ 查私信本身不花 token，只有真收到你的新消息时才花一点点。',
+            on: Boolean(dmWatch),
+            onChange: (v) => { setDmWatch(v); patch({ dmWatch: v }, '私信双向') },
+          }),
+          // ⭐ 2026-10-23：**不加新输入框**，只把"它认谁当主人"显示出来 —— 填错当场看得见 ✓
+          (st.ownerInfo && dmWatch) ? h('div', { 'data-bd-note': '' },
+            '它会认这个人当主人：',
+            (st.ownerInfo.name ? st.ownerInfo.name + ' · ' : ''),
+            'uid ' + st.ownerInfo.uid,
+            st.ownerInfo.self ? '（就是现在登录的这个号）' : '',
+            ' —— 想换人，改上面那个「要 @ 谁」就行') : null,
+          h('div', { 'data-bd-note': '' },
+            '私信的节奏（每天几条 / 间隔 / 免打扰 / 保质期）在「日常 → 它怎么发给你」里调；'
+            + '本地转写（没字幕的视频在本机转一遍）已经挪到「高级」。')),
+
+        /* ══════════════ 偏好 · 想让它找什么 ══════════════ */
+        h('div', { 'data-bd-sec': '', 'data-bd-group': 'taste', 'data-bd-away': tab === 'taste' ? undefined : '' },
+          h('div', { 'data-bd-h': '' }, '想让它找什么'),
+          h('div', { 'data-bd-label': '' }, '一段话：这一轮想看什么（以它为主）'),
+          h('textarea', {
+            'data-bd-input': '', rows: 4,
+            placeholder: '比如：想看真正上手 DeepSeek Harness 的实操，最好带命令和踩坑；少看发布会和吹水的。',
+            value: brief ?? '', onChange: (e) => setBrief(e.target.value),
+          }),
+          h('div', { 'data-bd-note': '' },
+            '它会按这段话自己决定：刷首页推荐流，还是从这段话里提炼几个词去搜 —— 挑的时候也按这段话筛。'
+            + '留空 = 退回老办法（有下面那些关键词就搜关键词，没有就刷推荐流）。'),
+          // ⭐ 和「人设」一样把字数亮出来：宿主那边超 4000 会截（别让人以为写的全生效了）
+          h('div', { 'data-bd-note': '' },
+            '字数：' + String(brief ?? '').length
+            + (String(brief ?? '').length > 4000 ? '（⚠️ 超过 4000，保存时会被截到 4000）' : '')),
+          h('div', { 'data-bd-label': '' }, '老的关键词（当作「你可能想搜这些」）—— 一行一个；填了上面那段话时它只是参考，不是硬指令'),
+          h('textarea', {
+            'data-bd-input': '', rows: 3, placeholder: '一行一个关键词；留空 = 刷首页推荐流（像人一样随便逛）',
+            value: kws ?? '', onChange: (e) => setKws(e.target.value),
+          }),
+          /* ⭐ 2026-11 工单 03：可选数值硬门槛 —— 默认关；开了先按三条筛，挡掉的条数进日报，也从 /status 读回来 */
+          h('div', { 'data-bd-h': '' }, '硬门槛（可选 · 默认关）'),
+          h(ToggleRow, {
+            label: '先按数值筛一遍',
+            note: '开了以后它先按下面三条挡掉明显不合格的（不读字幕），挡掉的条数会写进当天的日报（日报关着就记不了）。关着 = 行为和以前一样。',
+            on: sw('gateEnabled'),
+            onChange: (v) => patch({ gateEnabled: v }, '硬门槛'),
+          }),
+          sw('gateEnabled') ? h('div', { 'data-bd-sub': '' },
+            h(NumRow, {
+              label: '最低播放量',
+              note: '0 = 不限 · 最多 1000 万',
+              value: gateViews ?? '0', min: 0, max: GATE_UI_MAX.views,
+              onChange: (v) => setGateViews(v),
+              onBlur: () => { const n = Math.max(0, Math.min(Math.floor(Number(gateViews) || 0), GATE_UI_MAX.views)); setGateViews(String(n)); patch({ gateMinViews: n }, '最低播放量') },
+            }),
+            h(NumRow, {
+              label: '最短时长（分钟）',
+              note: '0 = 不限 · 最多 600（10 小时）',
+              value: gateMin ?? '0', min: 0, max: GATE_UI_MAX.minutes,
+              onChange: (v) => setGateMin(v),
+              onBlur: () => { const n = Math.max(0, Math.min(Math.floor(Number(gateMin) || 0), GATE_UI_MAX.minutes)); setGateMin(String(n)); patch({ gateMinMinutes: n }, '最短时长') },
+            }),
+            h(NumRow, {
+              label: '只看最近几天发布的',
+              note: '0 = 不限 · 最多 365 天',
+              value: gateDays ?? '0', min: 0, max: GATE_UI_MAX.days,
+              onChange: (v) => setGateDays(v),
+              onBlur: () => { const n = Math.max(0, Math.min(Math.floor(Number(gateDays) || 0), GATE_UI_MAX.days)); setGateDays(String(n)); patch({ gateWithinDays: n }, '发布时间窗') },
+            }),
+            h('div', { 'data-bd-note': '' }, '三条都填 0 = 等于没开（0 都是「不限」）。'),
+            h('div', { 'data-bd-note': '' },
+              '今天硬门槛挡掉 ' + (Number(st.gateBlocked) || 0) + ' 条（读自今天的日报；这一行由它在报告里写，没写就按 0 算）')) : null,
+          h('div', { 'data-bd-label': '' }, '排除词（一行一个）—— 标题 / UP / 简介里出现这些词的，整条跳过'),
+          h('textarea', {
+            'data-bd-input': '', rows: 3, placeholder: '一行一个词；留空 = 不过滤',
+            value: excl ?? '', onChange: (e) => setExcl(e.target.value),
+          }),
+          h('div', { 'data-bd-label': '' }, '要搜的时候怎么排序'),
+          h('select', { 'data-bd-input': '', value: fSort ?? 'pubdate', onChange: (e) => setFSort(e.target.value) },
+            h('option', { value: 'pubdate' }, '最新（默认，适合看近几天）'),
+            h('option', { value: 'click' }, '播放最多'),
+            h('option', { value: 'dm' }, '弹幕最多'),
+            h('option', { value: 'totalrank' }, '综合'))),
+
+        /* ══════════════ 偏好 · 人设（唯一的人格来源） ══════════════ */
+        h('div', { 'data-bd-sec': '', 'data-bd-group': 'taste', 'data-bd-away': tab === 'taste' ? undefined : '' },
+          h('div', { 'data-bd-h': '' }, '它按什么说话（人设提示词）'),
+          h('div', { 'data-bd-note': '' },
+            '这是唯一的人格来源：私信草稿、公开评论、回复都用它。留空 = 按中性说话，'
+            + '而且不会公开评论（「互动」里那个开关会置灰）—— 私信仍会按中性说法写。'),
+          h('textarea', {
+            'data-bd-input': '', rows: 6,
+            placeholder: '想让它怎么说话就写在这儿 —— 比如「叫我某某，说话简短点，别用 emoji」。也可以直接填一个文件路径（如 D:\\deepseek\\AGENTS.md，或它所在的那个目录），每次运行都会重新读那个文件。留空 = 按中性说话（不扮演任何人）。',
+            value: persona ?? '', onChange: (e) => setPersona(e.target.value),
+          }),
+          // ⭐ 2.0.5（issue #89）：把人设字数亮出来 —— 超 40000 只送前 40000、超 60000 保存就截，得让用户自己看得见
+          h('div', { 'data-bd-note': '' },
+            '字数：' + String(persona ?? '').length
+            + (String(persona ?? '').length > 40000 ? '（⚠️ 超过 40000，超出的部分不会生效）' : '')
+            + (String(persona ?? '').length > 60000 ? '（⚠️ 超过 60000，保存时会被截断）' : '')),
+          h('div', { 'data-bd-note': '' },
+            (st.personaFromWs && String(persona || '').trim() === '')
+              ? '你现在还是用「工作区」里那份 AGENTS.md 说话的（照旧生效）。想把它搬到这儿改，就把上面的路径填成本机那个目录。'
+              : '改完点上面那个「保存」；下一轮就按这个说话。'),
+          // ⭐ 工单 10：人设与「互动 → 公开评论」的置灰说明必须是同一套口径（都来自 /status.commentAvailable）
+          h('div', { 'data-bd-note': '' },
+            commentAvailable
+              ? '人设已就位 ⇒ 「互动」里的「公开评论」可以打开。'
+              : '人设还没就位（' + personaNote + '）⇒ 「互动」里的「公开评论」现在置灰。')),
+
+        /* ══════════════ 偏好 · 日报与收藏 ══════════════ */
+        h('div', { 'data-bd-sec': '', 'data-bd-group': 'taste', 'data-bd-away': tab === 'taste' ? undefined : '' },
+          h('div', { 'data-bd-h': '' }, '日报与收藏'),
+          h('div', { 'data-bd-label': '' }, '日报写多细'),
+          h('select', {
+            'data-bd-input': '', value: rl ?? 'full',
+            onChange: (e) => { setRl(e.target.value); patch({ reportLevel: e.target.value }, '日报形态') },
+          },
+            h('option', { value: 'full' }, '完整 —— 每条：标题 / UP / 为什么值得（默认）'),
+            h('option', { value: 'brief' }, '薄 —— 每条一两行，只留值不值得 + 链接'),
+            h('option', { value: 'off' }, '不写 —— 不生成日报文件')),
+          h('div', { 'data-bd-note': '' },
+            '日报不再决定「今天该发几条」（那是投递账的事），但队列、通知和每条的状态都会写进去，回头能翻。'),
+          h('div', { 'data-bd-label': '' }, '自动收藏到（这一轮挑中的视频存进你的收藏夹）'),
+          h('select', {
+            'data-bd-input': '', value: favId ?? '0',
+            onChange: (e) => { setFavId(e.target.value); patch({ favFolderId: Math.max(0, Number(e.target.value) || 0) }, '自动收藏') },
+          },
+            h('option', { value: '0' }, '不收藏（默认）'),
+            (favFolders || []).map((f) => h('option', { key: String(f.id), value: String(f.id) }, `${f.title}（${f.count} 条）`))),
+          h('div', { 'data-bd-row': '' },
+            h('button', { 'data-bd-btn': '', disabled: busy === 'fav', onClick: onFavToday }, '补收藏今天的'),
+            h('div', { 'data-bd-note': '' },
+              favFolders === null ? '收藏夹列表读取中…'
+                : (favFolders.length ? '每轮跑完会把挑中的视频存进上面选的收藏夹'
+                  : '读不到收藏夹 —— 先「扫码登录」，或过会儿重开设置页')))),
+
+        /* ══════════════ 偏好 · 工作区 ══════════════ */
+        h('div', { 'data-bd-sec': '', 'data-bd-group': 'taste', 'data-bd-away': tab === 'taste' ? undefined : '' },
+          h('div', { 'data-bd-h': '' }, '工作区'),
+          h('select', {
+            'data-bd-input': '', value: wsValue,
+            onChange: (e) => patch({ workspace: e.target.value }, '工作区'),
+          },
+            h('option', { value: '' }, '不限定（会话留在插件家，不归任何工作区）'),
+            ...(wsList || []).map((w) => h('option', { key: w.id, value: w.path },
+              (w.title || w.path) + '（' + w.path + '）')),
+            (wsValue && !(wsList || []).some((w) => normWs(w.path) === normWs(wsValue)))
+              ? h('option', { value: wsValue }, wsValue + '（当前设置，不在列表里）') : null),
+          h('div', { 'data-bd-note': '' },
+            '采集轮就跑在这个目录里：会话会归到这个工作区（而不是侧栏「未分组」）、它的 AGENTS.md 会作为人设参考，'
+            + '「刷过的视频」tab 也只在这个工作区的会话里出现。'),
+          wsList === null ? h('div', { 'data-bd-note': '' }, '工作区列表读取中…') : null,
+          (wsList && wsList.length === 0) ? h('div', { 'data-bd-note': '' }, 'DSH 里还没建过工作区 —— 先在左侧新建一个，再回来选。') : null),
+
+        /* ══════════════ 高级 · 用哪个模型跑 / provider 状态 ══════════════ */
         h('div', { 'data-bd-sec': '', 'data-bd-group': 'adv', 'data-bd-away': tab === 'adv' ? undefined : '' },
           h('div', { 'data-bd-h': '' }, '用哪个模型跑'),
           h('select', {
@@ -831,13 +1360,14 @@ function WatchTab() {
             '它每轮是另起一个 headless 会话跑的 —— 默认用你在会话里选的那个模型；'
             + '想让它固定用某个（比如更省 / 更强），就在这里选。改完下一轮生效，不用重启。'),
           h('div', { 'data-bd-note': '' },
-            '值班轮跑在另一个 profile（默认 `bili-duty`），但每轮会把**你正在用的主 profile**'
+            '采集轮跑在另一个 profile（默认 `bili-duty`），但每轮会把**你正在用的主 profile**'
             + (mirror && mirror.profile ? '（`' + mirror.profile + '`）' : '')
             + '里配好的 provider 定义镜像过去 ⇒ 上面列的就是这一轮真能用的：DeepSeek 两条 + 你自己配的第三方 provider。'
             + '镜像只搬 `config.providers` 那一段、密钥不复制（仍走 apiKeyEnv / 凭据库）；主 profile 的配置改了，下一轮自动生效。'),
+          /* ⭐ 工单 10：把 02 的 mirror.rejected / mirror.error 用可读方式摆出来（不是只留一个必然 NO_ADAPTER 的选项） */
           mirror && mirror.rejected && mirror.rejected.length
             ? h('div', { 'data-bd-msg': '', 'data-warn': '' },
-              '主 profile 里有 ' + mirror.rejected.length + ' 个 provider 没镜像过来（含内联密钥）：'
+              '主 profile 里有 ' + mirror.rejected.length + ' 个 provider 没镜像过来（配了内联密钥）：'
               + mirror.rejected.map((x) => x.provider + '（' + x.key + '）').join('、')
               + '。改成 apiKeyEnv 引用环境变量后，下一轮就会带上。') : null,
           mirror && mirror.ok === false
@@ -880,92 +1410,36 @@ function WatchTab() {
               : st.model.source === 'fallback' ? '（兜底，见上面的提示）'
                 : '（跟随当前会话）')) : null),
 
-        /* ── 发言与转写 ── */
-        h('div', { 'data-bd-sec': '', 'data-bd-group': 'social', 'data-bd-away': tab === 'social' ? undefined : '' },
-          h('div', { 'data-bd-h': '' }, '它怎么把结果给你'),
-          h(ToggleRow, {
-            label: '私信发给我',
-            note: '默认开。采集轮只把候选攒进队列，宿主按它一条一条私信发给你。关掉 = 不建队列、不投递，采集轮退回写日报。',
-            on: sw('channelDm'),
-            onChange: (v) => patch({ channelDm: v }, '私信'),
-          }),
-          h(ToggleRow, {
-            label: '在视频下公开评论 @ 我',
-            note: personaMissing
-              ? '人设留空时不会公开说话 —— 先填「人设提示词」，这个开关才能生效。'
-              : '公开，别人也看得见。人设留空时不会公开说话。',
-            on: sw('channelComment'),
-            disabled: personaMissing,
-            onChange: (v) => patch({ channelComment: v }, '公开评论'),
-          }),
-          (personaMissing && sw('channelComment')) ? h('div', { 'data-bd-note': '' },
-            '「公开评论」存着是开，但现在不会发：' + (st.commentBlockedReason || '人设留空')) : null,
-          h('div', { 'data-bd-label': '' }, '发给谁 / @ 谁（B站 昵称）'),
-          h('input', {
-            'data-bd-input': '', value: mention ?? '',
-            placeholder: '填你自己的 B站 昵称；私信按它查 UID，评论也 @ 它',
-            onChange: (e) => setMention(e.target.value),
-            onBlur: () => { const v = String(mention || '').trim(); setMention(v); patch({ mentionName: v }, '发给谁') },
-          }),
-          sw('channelDm') ? h('div', { 'data-bd-note': '' }, '私信会发给他（用昵称自动查一次 UID；查不到就先攒着，不会一条都不送）。') : null,
-          sw('channelDm') ? h('div', { 'data-bd-note': '' }, '私信内容 = 队列里的一条视频 + 一段按人设写好的草稿；一条一条发，不打包。⚠️ 建议先让这个号和收件人互关：B站 对「陌生人私信」会限流，还可能不弹提醒。') : null,
+        /* ══════════════ 高级 · 环境与账号 ══════════════ */
+        h('div', { 'data-bd-sec': '', 'data-bd-group': 'adv', 'data-bd-away': tab === 'adv' ? undefined : '' },
+          h('div', { 'data-bd-h': '' }, '环境与账号'),
+          h('div', { 'data-bd-row': '' },
+            h('button', { 'data-bd-btn': '', disabled: busy === 'install', onClick: onInstall },
+              st.venvReady ? '重装主依赖' : '装主依赖（建 venv）'),
+            h('button', { 'data-bd-btn': '', disabled: busy === 'check', onClick: onCheck }, '测一下'),
+            h('button', { 'data-bd-btn': '', disabled: busy === 'update', onClick: onCheckUpdate }, '检查更新'),
+            newVer ? h('button', { 'data-bd-btn': '', 'data-primary': '', disabled: busy === 'upgrade', onClick: onUpgrade }, '一键升级到 v' + newVer) : null,
+            h('button', { 'data-bd-btn': '', disabled: busy === 'login', onClick: onLoginStart }, '扫码登录'),
+            h('div', { 'data-bd-note': '' },
+              !st.venvReady ? (st.installFailed ? '上次没装成 → 看下面日志' : '还没装 → 先点「装主依赖」')
+                : (st.loggedIn ? '装好了 → 下一步「扫码登录」' : '环境好了 → 点「扫码登录」'))),
+          loginState ? h('div', { 'data-bd-msg': '', 'data-good': loginTone === 'good' ? '' : undefined, 'data-warn': loginTone === 'warn' ? '' : undefined }, loginState) : null,
+          st.installTail ? h('div', null,
+            h('div', { 'data-bd-note': '' }, st.installing ? '正在装主依赖（进度）：' : '主依赖的日志（B站 搜索 / 字幕 / 评论 用得到，末尾）：'),
+            h('pre', { 'data-bd-pre': '' }, st.installTail)) : null,
+          login?.qr ? h('div', { 'data-bd-qr': '' },
+            h('img', { src: login.qr, alt: 'B站登录二维码' }),
+            h('div', { 'data-bd-note': '' },
+              '手机 B站 → 我的 → 扫一扫。',
+              h('br'),
+              '确认时选「记住我 / 长期」那张 —— 选 24 小时的话，明天就得重扫。')) : null,
+          (Array.isArray(st.missingDeps) && st.missingDeps.length)
+            ? h('div', { 'data-bd-note': '' }, '还缺这几项：' + st.missingDeps.join(' / ') + '（qrcode = 画登录二维码用的）—— 点一次「重装主依赖」就会补上')
+            : null),
 
-          sw('channelComment') ? h('div', { 'data-bd-sep': '' }) : null,
-          sw('channelComment') ? h('div', { 'data-bd-sub': '' },
-            h('div', { 'data-bd-row': '' },
-              h('div', { 'data-bd-grow': '' },
-                h('div', { 'data-bd-label': '' }, '每轮最多发几条评论'),
-                h('div', { 'data-bd-note': '' }, '每条评论里 @ 一次上面那个人；填 0 = 这一轮不发评论')),
-              h('input', {
-                'data-bd-input': '', 'data-bd-num': '', type: 'number', min: 0, max: 20,
-                value: perRound ?? '',
-                onChange: (e) => setPerRound(e.target.value),
-                onBlur: () => { const n = Math.max(0, Math.min(Number(perRound) || 0, 20)); setPerRound(String(n)); patch({ commentPerRound: n }, '每轮发几条评论') },
-              }))) : null,
-          sw('channelComment') ? h('div', { 'data-bd-sub': '' },
-            h('div', { 'data-bd-row': '' },
-              h('div', { 'data-bd-grow': '' },
-                h('div', { 'data-bd-label': '' }, '评论写多长'),
-                h('div', { 'data-bd-note': '' }, '短 ≤15 字 · 中 ≤40 字 · 长 ≤100 字（默认中）')),
-              h('select', {
-                'data-bd-input': '', value: cLen ?? 'medium',
-                onChange: (e) => { setCLen(e.target.value); patch({ commentLength: e.target.value }, '评论长度') },
-              },
-                h('option', { value: 'short' }, '短'),
-                h('option', { value: 'medium' }, '中'),
-                h('option', { value: 'long' }, '长')))) : null,
-          sw('channelComment') ? h(ToggleRow, {
-            label: '回复评论（只回楼中楼）',
-            note: '开了之后它只回「直接回复到你那条评论下面的人」，不参与讨论',
-            on: sw('replyToComments'),
-            onChange: (v) => patch({ replyToComments: v }, '回复评论'),
-          }) : null,
-          sw('channelComment') && sw('replyToComments') ? h('div', { 'data-bd-sub': '' },
-            h('div', { 'data-bd-row': '' },
-              h('div', { 'data-bd-grow': '' },
-                h('div', { 'data-bd-label': '' }, '每轮最多回几条'),
-                h('div', { 'data-bd-note': '' }, '只回直接回在你那条评论下面的人')),
-              h('input', {
-                'data-bd-input': '', 'data-bd-num': '', type: 'number', min: 1, max: 10,
-                value: replyPer ?? '',
-                onChange: (e) => setReplyPer(e.target.value),
-                onBlur: () => { const n = Math.max(1, Math.min(Number(replyPer) || 1, 10)); setReplyPer(String(n)); patch({ replyPerRound: n }, '每轮回几条') },
-              }))) : null,
-
-          h('div', { 'data-bd-sep': '' }),
-          h(ToggleRow, {
-            label: '私信双向（有人私信它就回一句）',
-            note: '默认开。你在 B站 私信里跟它说话，它会回你（陌生人的私信不回）。⭐ 查私信本身不花 token，只有真收到你的新消息时才花一点点。',
-            on: Boolean(dmWatch),
-            onChange: (v) => { setDmWatch(v); patch({ dmWatch: v }, '私信双向') },
-          }),
-          // ⭐ 2026-10-23：**不加新输入框**，只把"它认谁当主人"显示出来 —— 填错当场看得见 ✓
-          (st.ownerInfo && dmWatch) ? h('div', { 'data-bd-note': '' },
-            '它会认这个人当主人：',
-            (st.ownerInfo.name ? st.ownerInfo.name + ' · ' : ''),
-            'uid ' + st.ownerInfo.uid,
-            st.ownerInfo.self ? '（就是现在登录的这个号）' : '',
-            ' —— 想换人，改上面那个「要 @ 谁」就行') : null,
+        /* ══════════════ 高级 · 本地转写（从「互动」挪过来：它是环境重活，不是互动） ══════════════ */
+        h('div', { 'data-bd-sec': '', 'data-bd-group': 'adv', 'data-bd-away': tab === 'adv' ? undefined : '' },
+          h('div', { 'data-bd-h': '' }, '本地转写'),
           h(ToggleRow, {
             label: '本地转写没字幕的视频',
             note: '默认关；开了以后，没字幕的视频会在本机转写一遍（不花 API 钱）',
@@ -987,173 +1461,9 @@ function WatchTab() {
               h('div', { 'data-bd-note': '' }, st.asrInstalling ? '正在装转写依赖（进度）：' : '转写依赖的日志（末尾）—— 只有「没字幕的视频」用得到它：'),
               h('pre', { 'data-bd-pre': '' }, st.asrTail)) : null) : null),
 
-        /* ── 工作区（值班轮跑在哪儿 / 会话归到哪儿）── */
-        h('div', { 'data-bd-sec': '', 'data-bd-group': 'taste', 'data-bd-away': tab === 'taste' ? undefined : '' },
-          h('div', { 'data-bd-h': '' }, '工作区'),
-          h('select', {
-            'data-bd-input': '', value: wsValue,
-            onChange: (e) => patch({ workspace: e.target.value }, '工作区'),
-          },
-            h('option', { value: '' }, '不限定（会话留在插件家，不归任何工作区）'),
-            ...(wsList || []).map((w) => h('option', { key: w.id, value: w.path },
-              (w.title || w.path) + '（' + w.path + '）')),
-            (wsValue && !(wsList || []).some((w) => normWs(w.path) === normWs(wsValue)))
-              ? h('option', { value: wsValue }, wsValue + '（当前设置，不在列表里）') : null),
-          h('div', { 'data-bd-note': '' },
-            '值班轮就跑在这个目录里：会话会归到这个工作区（而不是侧栏「未分组」）、它的 AGENTS.md 会作为人设参考，'
-            + '「刷过的视频」tab 也只在这个工作区的会话里出现。'),
-          wsList === null ? h('div', { 'data-bd-note': '' }, '工作区列表读取中…') : null,
-          (wsList && wsList.length === 0) ? h('div', { 'data-bd-note': '' }, 'DSH 里还没建过工作区 —— 先在左侧新建一个，再回来选。') : null),
-
-        /* ── 口味：想让它找什么 / 硬门槛 / 排除词 ──
-         * ⭐ 2026-11 工单 03：简报（一段话）是「找什么」的主依据；老关键词降成「你可能想搜这些」；
-         *    硬门槛可选、默认关（关着 = 行为与以前一样）。 */
-        h('div', { 'data-bd-sec': '', 'data-bd-group': 'taste', 'data-bd-away': tab === 'taste' ? undefined : '' },
-          h('div', { 'data-bd-h': '' }, '想让它找什么'),
-          h('div', { 'data-bd-label': '' }, '一段话：这一轮想看什么（以它为主）'),
-          h('textarea', {
-            'data-bd-input': '', rows: 4,
-            placeholder: '比如：想看真正上手 DeepSeek Harness 的实操，最好带命令和踩坑；少看发布会和吹水的。',
-            value: brief ?? '', onChange: (e) => setBrief(e.target.value),
-          }),
-          h('div', { 'data-bd-note': '' },
-            '它会按这段话自己决定：刷首页推荐流，还是从这段话里提炼几个词去搜 —— 挑的时候也按这段话筛。'
-            + '留空 = 退回老办法（有下面那些关键词就搜关键词，没有就刷推荐流）。'),
-          // ⭐ 和「人设」一样把字数亮出来：宿主那边超 4000 会截（别让人以为写的全生效了）
-          h('div', { 'data-bd-note': '' },
-            '字数：' + String(brief ?? '').length
-            + (String(brief ?? '').length > 4000 ? '（⚠️ 超过 4000，保存时会被截到 4000）' : '')),
-          h('div', { 'data-bd-label': '' }, '老的关键词（当作「你可能想搜这些」）—— 一行一个；填了上面那段话时它只是参考，不是硬指令'),
-          h('textarea', {
-            'data-bd-input': '', rows: 3, placeholder: '一行一个关键词；留空 = 刷首页推荐流（像人一样随便逛）',
-            value: kws ?? '', onChange: (e) => setKws(e.target.value),
-          }),
-          /* ⭐ 2026-11 工单 03：可选数值硬门槛 —— 默认关；开了先按三条筛，挡掉的条数进日报，也从 /status 读回来 */
-          h('div', { 'data-bd-h': '' }, '硬门槛（可选 · 默认关）'),
-          h(ToggleRow, {
-            label: '先按数值筛一遍',
-            note: '开了以后它先按下面三条挡掉明显不合格的（不读字幕），挡掉的条数会写进当天的日报（日报关着就记不了）。关着 = 行为和以前一样。',
-            on: sw('gateEnabled'),
-            onChange: (v) => patch({ gateEnabled: v }, '硬门槛'),
-          }),
-          sw('gateEnabled') ? h('div', { 'data-bd-sub': '' },
-            h('div', { 'data-bd-row': '' },
-              h('div', { 'data-bd-grow': '' },
-                h('div', { 'data-bd-label': '' }, '最低播放量'),
-                h('div', { 'data-bd-note': '' }, '0 = 不限 · 最多 1000 万')),
-              h('input', {
-                'data-bd-input': '', 'data-bd-num': '', type: 'number', min: 0, max: GATE_UI_MAX.views,
-                value: gateViews ?? '0',
-                onChange: (e) => setGateViews(e.target.value),
-                onBlur: () => { const n = Math.max(0, Math.min(Math.floor(Number(gateViews) || 0), GATE_UI_MAX.views)); setGateViews(String(n)); patch({ gateMinViews: n }, '最低播放量') },
-              })),
-            h('div', { 'data-bd-row': '' },
-              h('div', { 'data-bd-grow': '' },
-                h('div', { 'data-bd-label': '' }, '最短时长（分钟）'),
-                h('div', { 'data-bd-note': '' }, '0 = 不限 · 最多 600（10 小时）')),
-              h('input', {
-                'data-bd-input': '', 'data-bd-num': '', type: 'number', min: 0, max: GATE_UI_MAX.minutes,
-                value: gateMin ?? '0',
-                onChange: (e) => setGateMin(e.target.value),
-                onBlur: () => { const n = Math.max(0, Math.min(Math.floor(Number(gateMin) || 0), GATE_UI_MAX.minutes)); setGateMin(String(n)); patch({ gateMinMinutes: n }, '最短时长') },
-              })),
-            h('div', { 'data-bd-row': '' },
-              h('div', { 'data-bd-grow': '' },
-                h('div', { 'data-bd-label': '' }, '只看最近几天发布的'),
-                h('div', { 'data-bd-note': '' }, '0 = 不限 · 最多 365 天')),
-              h('input', {
-                'data-bd-input': '', 'data-bd-num': '', type: 'number', min: 0, max: GATE_UI_MAX.days,
-                value: gateDays ?? '0',
-                onChange: (e) => setGateDays(e.target.value),
-                onBlur: () => { const n = Math.max(0, Math.min(Math.floor(Number(gateDays) || 0), GATE_UI_MAX.days)); setGateDays(String(n)); patch({ gateWithinDays: n }, '发布时间窗') },
-              })),
-            h('div', { 'data-bd-note': '' }, '三条都填 0 = 等于没开（0 都是「不限」）。'),
-            h('div', { 'data-bd-note': '' },
-              '今天硬门槛挡掉 ' + (Number(st.gateBlocked) || 0) + ' 条（读自今天的日报；这一行由它在报告里写，没写就按 0 算）')) : null,
-          h('div', { 'data-bd-label': '' }, '排除词（一行一个）—— 标题 / UP / 简介里出现这些词的，整条跳过'),
-          h('textarea', {
-            'data-bd-input': '', rows: 3, placeholder: '一行一个词；留空 = 不过滤',
-            value: excl ?? '', onChange: (e) => setExcl(e.target.value),
-          }),
-          h('div', { 'data-bd-label': '' }, '要搜的时候怎么排序'),
-          h('select', { 'data-bd-input': '', value: fSort ?? 'pubdate', onChange: (e) => setFSort(e.target.value) },
-            h('option', { value: 'pubdate' }, '最新（默认，适合看近几天）'),
-            h('option', { value: 'click' }, '播放最多'),
-            h('option', { value: 'dm' }, '弹幕最多'),
-            h('option', { value: 'totalrank' }, '综合')),
-          h('div', { 'data-bd-label': '' }, '它按什么说话（人设提示词）—— 留空也能用：默认口语、短句、必带一个只有看了那条视频才说得出的细节'),
-          h('textarea', {
-            'data-bd-input': '', rows: 6,
-            placeholder: '想让它怎么说话就写在这儿 —— 比如「叫我某某，说话简短点，别用 emoji」。也可以直接填一个文件路径（如 D:\\deepseek\\AGENTS.md，或它所在的那个目录），每次运行都会重新读那个文件。留空 = 按中性说话（不扮演任何人）。',
-            value: persona ?? '', onChange: (e) => setPersona(e.target.value),
-          }),
-          // ⭐ 2.0.5（issue #89）：把人设字数亮出来 —— 超 40000 只送前 40000、超 60000 保存就截，得让用户自己看得见
-          h('div', { 'data-bd-note': '' },
-            '字数：' + String(persona ?? '').length
-            + (String(persona ?? '').length > 40000 ? '（⚠️ 超过 40000，超出的部分不会生效）' : '')
-            + (String(persona ?? '').length > 60000 ? '（⚠️ 超过 60000，保存时会被截断）' : '')),
-          h('div', { 'data-bd-note': '' },
-            (st.personaFromWs && String(persona || '').trim() === '')
-              ? '你现在还是用「工作区」里那份 AGENTS.md 说话的（照旧生效）。想把它搬到这儿改，就把上面的路径填成本机那个目录。'
-              : '改完点下面「保存」；下一轮就按这个说话。'),
-          h('div', { 'data-bd-label': '' }, '日报写多细'),
-          h('select', {
-            'data-bd-input': '', value: rl ?? 'full',
-            onChange: (e) => { setRl(e.target.value); patch({ reportLevel: e.target.value }, '日报形态') },
-          },
-            h('option', { value: 'full' }, '完整 —— 每条：标题 / UP / 为什么值得（默认）'),
-            h('option', { value: 'brief' }, '薄 —— 每条一两行，只留值不值得 + 链接'),
-            h('option', { value: 'off' }, '不写 —— 只发评论，不生成日报文件')),
-        h('div', { 'data-bd-label': '' }, '自动收藏到（这一轮挑中的视频存进你的收藏夹）'),
-        h('select', {
-          'data-bd-input': '', value: favId ?? '0',
-          onChange: (e) => { setFavId(e.target.value); patch({ favFolderId: Math.max(0, Number(e.target.value) || 0) }, '自动收藏') },
-        },
-          h('option', { value: '0' }, '不收藏（默认）'),
-          (favFolders || []).map((f) => h('option', { key: String(f.id), value: String(f.id) }, `${f.title}（${f.count} 条）`))),
-        h('div', { 'data-bd-row': '' },
-          h('button', { 'data-bd-btn': '', disabled: busy === 'fav', onClick: onFavToday }, '补收藏今天的'),
-          h('div', { 'data-bd-note': '' },
-            favFolders === null ? '收藏夹列表读取中…'
-              : (favFolders.length ? '每轮跑完会把挑中的视频存进上面选的收藏夹'
-                : '读不到收藏夹 —— 先「扫码登录」，或过会儿重开设置页'))),
-
-          h('div', { 'data-bd-row': '' },
-            msg ? h('div', { 'data-bd-msg': '', 'data-good': msgTone === 'good' ? '' : undefined, 'data-warn': msgTone === 'warn' ? '' : undefined }, msg) : null)),
-
-        /* ── 环境与账号 ── */
-        /* ── 它刷过的视频 ── */
-        h('div', { 'data-bd-sec': '', 'data-bd-group': 'daily', 'data-bd-away': tab === 'daily' ? undefined : '' },
-          h('div', { 'data-bd-h': '' }, '它刷过的视频'),
-          h('div', { 'data-bd-row': '' },
-            h('button', { 'data-bd-btn': '', disabled: busy === 'watched', onClick: () => (watchedRows !== null ? setWatchedRows(null) : onLoadWatched(watchedState, watchedTier, watchedOffset)) },
-              watchedRows !== null ? '收起' : '看它刷过什么'),
-            h('div', { 'data-bd-note': '' },
-              watchedRows === null ? '（点一下读出来；数据来自判重表 seen.md + 报告里的档位）'
-                : (watchedTotal ? `共 ${watchedTotal} 条` : '这一类还没有记录 —— 跑一轮之后就有了'))),
-          watchedRows !== null ? h('div', { 'data-bd-row': '' },
-            [['', '全部'], ['picked', '挑了'], ['skipped', '跳过'], ['commented', '发给你了']].map(([v, label]) =>
-              h('button', { key: v || 'all', 'data-bd-chip': '', 'aria-selected': watchedState === v ? 'true' : 'false', onClick: () => onWatchPick('state', v) }, label)),
-            ['值得看', '可以看', '不值当'].map((v) =>
-              h('button', { key: v, 'data-bd-chip': '', 'aria-selected': watchedTier === v ? 'true' : 'false', onClick: () => onWatchPick('tier', v) }, v))) : null,
-          watchedRows !== null && watchedRows.length ? h('div', { 'data-bd-list': '' },
-            watchedRows.map((x, i) => h('div', { key: x.day + x.bvid, 'data-bd-item': '' },
-              // 封面走宿主代理（直连 i0.hdslb.com 会被防盗链挡，也等于把使用者 IP 交出去）
-              i < 40 ? h('img', { 'data-bd-cover': '', src: API + '/cover?bv=' + x.bvid, loading: 'lazy', alt: '' }) : null,
-              h('div', { 'data-bd-item-body': '' },
-                h('div', { 'data-bd-item-t': '' },
-                  h('a', { href: x.url, target: '_blank', rel: 'noreferrer' }, x.title)),
-                h('div', { 'data-bd-item-n': '' },
-                  `${x.day} · ${x.up} · `, x.picked ? '挑中了' : '跳过', (x.delivered || x.commented) ? ' · 已发给你' : '',
-                  x.tier ? h('span', { 'data-bd-tier': x.tier }, ' · ' + x.tier) : null),
-                x.why ? h('div', { 'data-bd-item-why': '' }, x.why) : null))))
-            : null,
-          watchedRows !== null && watchedTotal > WATCH_PAGE ? h('div', { 'data-bd-row': '' },
-            h('button', { 'data-bd-btn': '', disabled: watchedOffset <= 0, onClick: () => onWatchPage(-WATCH_PAGE) }, '上一页'),
-            h('div', { 'data-bd-note': '' }, `${watchedOffset + 1}–${Math.min(watchedOffset + WATCH_PAGE, watchedTotal)} / ${watchedTotal}`),
-            h('button', { 'data-bd-btn': '', disabled: watchedOffset + WATCH_PAGE >= watchedTotal, onClick: () => onWatchPage(WATCH_PAGE) }, '下一页')) : null),
-
+        /* ══════════════ 高级 · 诊断与自检 ══════════════ */
         h('div', { 'data-bd-sec': '', 'data-bd-group': 'adv', 'data-bd-away': tab === 'adv' ? undefined : '' },
+          h('div', { 'data-bd-h': '' }, '诊断与自检'),
           h('div', { 'data-bd-row': '' },
             h('button', { 'data-bd-btn': '', disabled: busy === 'diag', onClick: onDiagnose }, '复制诊断信息'),
             h('button', { 'data-bd-btn': '', disabled: busy === 'selfcheck', onClick: onSelfCheck }, '环境自检'),
@@ -1163,33 +1473,9 @@ function WatchTab() {
               h('div', { 'data-bd-item-t': '' }, (x.ok ? '正常 · ' : '有问题 · ') + x.name),
               h('div', { 'data-bd-item-n': '' }, x.detail || ''),
               x.ok ? null : h('div', { 'data-bd-item-why': '' }, '怎么办：' + (x.fix || '把诊断信息发给作者'))))) : null,
-          diag ? h('pre', { 'data-bd-pre': '' }, diag) : null,
-          h('div', { 'data-bd-h': '' }, '环境与账号'),
-          h('div', { 'data-bd-row': '' },
-            h('button', { 'data-bd-btn': '', disabled: busy === 'install', onClick: onInstall },
-              st.venvReady ? '重装主依赖' : '装主依赖（建 venv）'),
-            h('button', { 'data-bd-btn': '', disabled: busy === 'check', onClick: onCheck }, '测一下'),
-            h('button', { 'data-bd-btn': '', disabled: busy === 'update', onClick: onCheckUpdate }, '检查更新'),
-            newVer ? h('button', { 'data-bd-btn': '', 'data-primary': '', disabled: busy === 'upgrade', onClick: onUpgrade }, '一键升级到 v' + newVer) : null,
-            h('button', { 'data-bd-btn': '', disabled: busy === 'login', onClick: onLoginStart }, '扫码登录'),
-            h('div', { 'data-bd-note': '' },
-              !st.venvReady ? (st.installFailed ? '上次没装成 → 看下面日志' : '还没装 → 先点「装主依赖」')
-                : (st.loggedIn ? '装好了 → 下一步「扫码登录」' : '环境好了 → 点「扫码登录」'))),
-          loginState ? h('div', { 'data-bd-msg': '', 'data-good': loginTone === 'good' ? '' : undefined, 'data-warn': loginTone === 'warn' ? '' : undefined }, loginState) : null,
-          st.installTail ? h('div', null,
-            h('div', { 'data-bd-note': '' }, st.installing ? '正在装主依赖（进度）：' : '主依赖的日志（B站 搜索 / 字幕 / 评论 用得到，末尾）：'),
-            h('pre', { 'data-bd-pre': '' }, st.installTail)) : null,
-          login?.qr ? h('div', { 'data-bd-qr': '' },
-            h('img', { src: login.qr, alt: 'B站登录二维码' }),
-            h('div', { 'data-bd-note': '' },
-              '手机 B站 → 我的 → 扫一扫。',
-              h('br'),
-              '确认时选「记住我 / 长期」那张 —— 选 24 小时的话，明天就得重扫。')) : null),
-          (Array.isArray(st.missingDeps) && st.missingDeps.length)
-            ? h('div', { 'data-bd-note': '' }, '还缺这几项：' + st.missingDeps.join(' / ') + '（qrcode = 画登录二维码用的）—— 点一次「重装主依赖」就会补上')
-            : null,
+          diag ? h('pre', { 'data-bd-pre': '' }, diag) : null),
 
-        /* ── 它是怎么干活的（给他看的） ── */
+        /* ══════════════ 高级 · 它的地盘 / 报告 ══════════════ */
         h('div', { 'data-bd-sec': '', 'data-bd-group': 'adv', 'data-bd-away': tab === 'adv' ? undefined : '' },
           h('div', { 'data-bd-h': '' }, '它的地盘'),
           h('div', { 'data-bd-kv': '' },
