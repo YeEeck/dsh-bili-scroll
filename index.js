@@ -46,6 +46,7 @@ import {
 } from './lib/queue.mjs'
 import { buildWhitelist } from './lib/tool-whitelist.mjs'
 import { CHANNEL_MIGRATION_FILE, planChannelMigration } from './lib/channels.mjs'
+import { createDeliveryClock, createNotifier, readBaseline } from './lib/delivery-clock.mjs'
 
 import { loginStart, loginPoll, saveCredential, renderQrPng } from './lib/login.mjs'
 import { resolveUid } from './lib/uid.mjs'
@@ -104,6 +105,20 @@ export const Config = !z ? undefined : z.object({
   queueTtlHours: z.natural().default(24).extra('volatile', true),
   /** ⭐ 采集轮一次最多采几条 · 有效范围 1–10（提示词里那个数；投递不在这里发生） */
   collectBatch: z.natural().default(3).extra('volatile', true),
+  /** ⭐ 工单 07：自动投递 —— 每天最多发几条（0 = 不自动投递）· 有效范围 0–50，口径见 clampPatch */
+  deliverPerDay: z.natural().default(5).extra('volatile', true),
+  /** ⭐ 工单 07：两条之间的最短间隔（分钟）· 有效范围 0–1440 */
+  deliverMinGapMin: z.natural().default(45).extra('volatile', true),
+  /** ⭐ 工单 07：两条之间的最长间隔（分钟）· 有效范围 0–1440，且不小于最短 */
+  deliverMaxGapMin: z.natural().default(120).extra('volatile', true),
+  /** ⭐ 工单 07：免打扰开始 'HH:MM'（含）· 起止相同 = 不设免打扰 */
+  quietStart: z.string().default('23:00').extra('volatile', true),
+  /** ⭐ 工单 07：免打扰结束 'HH:MM'（不含）· 可以跨零点（23:00–08:00） */
+  quietEnd: z.string().default('08:00').extra('volatile', true),
+  /** ⭐ 工单 07：失败重试次数（0–3）· 重试间隔固定 5 分钟（总尝试 = 次数 + 1） */
+  deliverRetries: z.natural().default(1).extra('volatile', true),
+  /** ⭐ 工单 07：故障时通知我（采集失败 / 连续投递失败）· 关掉则一条都不发 */
+  notifyOnFailure: z.boolean().default(true).extra('volatile', true),
   /** ⭐ 口味简报：一段自然语言「想让它找什么」—— 采集轮据此决定走推荐流还是自己提炼搜索词，并按它筛。
    *  留空 = 退回老办法（有关键词就搜关键词、没有就刷推荐流）；**有效上限 4000 字，口径见 clampPatch** */
   tasteBrief: z.string().default('').extra('volatile', true),
@@ -321,6 +336,9 @@ function reportMeta() {
     tasteBrief: '', gateEnabled: false, gateMinViews: 0, gateMinMinutes: 0, gateWithinDays: 0,
     // ⭐ 2026-11 工单 06（候选队列 / 采集轮）：默认值就是 spec 里定下的 3 条 / 24 小时 / 一轮 3 条
     queueLimit: 3, queueTtlHours: 24, collectBatch: 3,
+    // ⭐ 2026-11 工单 07（自动投递时钟）：间隔 / 免打扰 / 重试 / 故障通知 —— 默认就是 spec 里那几个数
+    deliverPerDay: 5, deliverMinGapMin: 45, deliverMaxGapMin: 120,
+    quietStart: '23:00', quietEnd: '08:00', deliverRetries: 1, notifyOnFailure: true,
   }
   const normalize = (src, base) => {
     const out = { ...base }
@@ -400,6 +418,30 @@ function reportMeta() {
     if ('queueLimit' in p) p.queueLimit = clampNum(p.queueLimit, QUEUE_LIMIT)
     if ('queueTtlHours' in p) p.queueTtlHours = clampNum(p.queueTtlHours, QUEUE_TTL_HOURS)
     if ('collectBatch' in p) p.collectBatch = clampNum(p.collectBatch, COLLECT_BATCH)
+    // ⭐ 2026-11 工单 07（自动投递时钟）：每日上限 / 间隔 / 免打扰 / 重试次数，写与读两头都钳。
+    //    ⚠️ 免打扰用 'HH:MM' 字符串；写坏了退回默认（起止相同 = 不设免打扰，这由策略判断）。
+    if ('deliverPerDay' in p) p.deliverPerDay = clampNum(p.deliverPerDay, { default: 5, min: 0, max: 50 })
+    if ('deliverMinGapMin' in p) p.deliverMinGapMin = clampNum(p.deliverMinGapMin, { default: 45, min: 0, max: 1440 })
+    if ('deliverMaxGapMin' in p) p.deliverMaxGapMin = clampNum(p.deliverMaxGapMin, { default: 120, min: 0, max: 1440 })
+    // 最长不能小于最短：只给了最短、又比默认最长还大时，把最长也抬上来
+    if ('deliverMinGapMin' in p && !('deliverMaxGapMin' in p) && p.deliverMinGapMin > 120) {
+      p.deliverMaxGapMin = p.deliverMinGapMin
+    }
+    if ('deliverMinGapMin' in p && 'deliverMaxGapMin' in p && p.deliverMaxGapMin < p.deliverMinGapMin) {
+      p.deliverMaxGapMin = p.deliverMinGapMin
+    }
+    const clampClockText = (v, fallback) => {
+      const m = /^(\d{1,2}):(\d{2})$/.exec(String(v ?? '').trim())
+      if (!m) return fallback
+      const h = Number(m[1])
+      const min = Number(m[2])
+      if (h > 23 || min > 59) return fallback
+      return String(h).padStart(2, '0') + ':' + String(min).padStart(2, '0')
+    }
+    if ('quietStart' in p) p.quietStart = clampClockText(p.quietStart, '23:00')
+    if ('quietEnd' in p) p.quietEnd = clampClockText(p.quietEnd, '08:00')
+    if ('deliverRetries' in p) p.deliverRetries = clampNum(p.deliverRetries, { default: 1, min: 0, max: 3 })
+    if ('notifyOnFailure' in p) p.notifyOnFailure = Boolean(p.notifyOnFailure)
     return p
   }
 
@@ -753,12 +795,20 @@ function reportMeta() {
     lock: deliveryLock,
     log,
   })
-  /** `/status` 要的两个最少字段：今天已投递几条（口径同 delivery-policy）、最近一次尝试 */
+  /** ⭐ 工单 07：故障通知器（写 notifications.jsonl + duty.log + 日报「通知」+ /status） */
+  const notifier = createNotifier({ stateDir, outDir, cfg, log })
+  /** `/status` 要的两个最少字段：今天已投递几条（口径同 delivery-policy）、最近一次尝试
+   *  ⭐ 工单 07：升级首日还要和一次性基线取最大 —— 否则换账本当天会静默多发一轮。 */
   const deliveryState = () => {
-    const s = summarizeDelivery(readDelivery(stateDir), { day: dayKey() })
+    const now = new Date()
+    const day = dayKey(now)
+    const s = summarizeDelivery(readDelivery(stateDir), { day })
+    const baseline = readBaseline(stateDir)
+    const baselineToday = baseline && baseline.day === day ? Math.max(0, Number(baseline.count) || 0) : 0
     const l = s.lastDelivery
     return {
-      deliveredToday: s.deliveredToday,
+      deliveredToday: Math.max(s.deliveredToday, baselineToday),
+      deliveredBaseline: baselineToday,
       lastDelivery: l ? {
         at: String(l.at ?? ''),
         status: String(l.status ?? ''),
@@ -1083,6 +1133,8 @@ function reportMeta() {
       + '口味：`{"tasteBrief":"我想看真正上手 DSH 的实操，少看发布会","gateEnabled":true,"gateMinViews":50000,"gateMinMinutes":8,"gateWithinDays":7}`'
       + '（简报是一段话，留空 = 退回老办法；三条门槛 0 = 不限，开关默认关）；'
       + '队列：`{"collectBatch":3,"queueLimit":3,"queueTtlHours":24}`（一轮最多采几条 / 队列上限 / 保质期小时）；'
+      + '投递：`{"deliverPerDay":5,"deliverMinGapMin":45,"deliverMaxGapMin":120,"quietStart":"23:00","quietEnd":"08:00","deliverRetries":1,"notifyOnFailure":true}`'
+      + '（每天最多几条 / 随机间隔范围 / 免打扰起止 / 失败重试次数 / 故障通知；0 条 = 不自动投递）；'
       + '⭐ 指定这一轮用哪个模型：`{"modelProvider":"deepseek-account","modelName":"deepseek-flash"}`'
       + '（两个都留空 = 跟随你当前会话选的模型；会话的 provider 这一轮没有时，改用 DeepSeek 兜底，并在 `status.model.sessionIgnored` 里标出来。'
       + '⭐ 这一轮能用哪些：DeepSeek 内置两条（`deepseek-account` / `deepseek-official`）+ 每轮从**主 profile** 的 `config.providers` 镜像过来的第三方 provider（按文件修改时间缓存，改了下一轮生效；密钥不复制）。'
@@ -1301,6 +1353,45 @@ function reportMeta() {
   }
 
   /**
+   * ⭐ 工单 07：投递改了队列（sent / expired / failed）之后刷新日报的「队列」小节。
+   * 复用 06 的 writeQueueReport；「本轮：入队/丢弃/过期/跳过」那一行沿用今天那一轮的统计
+   * （存在 state.json 的 queueStatsLast），别被刷新改写成 0。
+   */
+  const refreshQueueReport = (queue, at = new Date()) => {
+    try {
+      const st = readJson(dutyStateFile, {})
+      const saved = st.day === dayKey(at) && st.queueStatsLast && typeof st.queueStatsLast === 'object'
+        ? st.queueStatsLast
+        : null
+      writeQueueReport(queue, {
+        at,
+        stats: saved
+          ? {
+              enqueued: Math.max(0, Number(saved.enqueued) || 0),
+              dropped: Math.max(0, Number(saved.dropped) || 0),
+              expired: Math.max(0, Number(saved.expired) || 0),
+              skipped: Math.max(0, Number(saved.skipped) || 0),
+            }
+          : { enqueued: 0, dropped: 0, expired: 0, skipped: 0 },
+      })
+    } catch (e) { log('刷新日报「队列」小节失败（不影响投递）：' + String(e?.message ?? e)) }
+  }
+
+  /* ⭐ 工单 07：自动投递时钟 —— 60 秒一跳（定时器在下面挂），启动时立即跑一跳。
+   *    判断全在 lib/delivery-clock.mjs（可直接测）；这里只接发送通道与日报刷新。
+   *    `deliverNow` 是给 09「现在投递」用的发送入口（不是模型工具）。 */
+  const deliveryClock = createDeliveryClock({
+    stateDir,
+    outDir,
+    cfg,
+    now: () => new Date(),
+    sendPrivate,
+    log,
+    notifier,
+    onQueueChanged: refreshQueueReport,
+  })
+
+  /**
    * 一轮结束后的队列收尾：排干收件箱 → 过期 → 入队 → 落盘 → 清收件箱 → 写日报。
    * 返回这一轮的账（07/09 与测试都读它）；出错只记日志，**绝不让收尾把宿主带崩**。
    */
@@ -1346,7 +1437,14 @@ function reportMeta() {
         log('队列：入队 ' + stats.enqueued + ' 条 / 丢弃 ' + stats.dropped + ' 条 / 过期 '
           + stats.expired + ' 条 / 跳过 ' + stats.skipped + ' 条')
       }
-      bumpState({ queueDroppedLast: stats.dropped, queueDroppedAt: at.toISOString(), queueEnqueuedLast: stats.enqueued })
+      // ⭐ 工单 07：把这一轮的统计也存下来 —— 投递时钟刷新「队列」小节时要用它保留
+      //    「本轮：入队 N 条…」那一行，不能改成 0。
+      bumpState({
+        queueDroppedLast: stats.dropped,
+        queueDroppedAt: at.toISOString(),
+        queueEnqueuedLast: stats.enqueued,
+        queueStatsLast: { ...stats, at: at.toISOString() },
+      })
       writeQueueReport(enq.queue, { at, stats })
       return { ...stats, pending: queueView(enq.queue, { now: at }).pending }
     } catch (e) {
@@ -2242,6 +2340,33 @@ function reportMeta() {
     t.unref?.()
     return true
   }
+  /**
+   * ⭐ 工单 07：采集轮失败 ⇒ 一条可读通知（包括超时被 kill 掉：code=null + signal）。
+   * `notifyOnFailure=false` 时 notifier 自己会跳过；这里只负责把原因说清楚。
+   * ⚠️ 通知写不进去也绝不能影响这一轮的收尾 —— 全部包住。
+   */
+  const notifyCollectionFailure = (code, signal) => {
+    try {
+      if (!notifier.enabled()) return
+      const why = code === null || code === undefined
+        ? '被中止（' + String(signal || '信号') + '）'
+        : '退出码 ' + code
+      let title = ''
+      try {
+        const tail = readFileSync(logFile, 'utf8').slice(-6000)
+        title = diagnoseRound(tail)?.title || ''
+      } catch { /* 诊断不出来就只说退出码 */ }
+      notifier.notify({
+        kind: 'collect-failed',
+        message: '采集失败：这一轮没跑成（' + why + '）'
+          + (title ? ' —— ' + title : '')
+          + '。详情看 duty.log 或今天的报告。',
+      })
+    } catch (e) {
+      log('采集失败通知没写成（不影响主流程）：' + String(e?.message ?? e))
+    }
+  }
+
   const runDuty = (why = 'window') => {
    try {
       if (dutyChild) {
@@ -2326,11 +2451,11 @@ function reportMeta() {
     dutyStartedAt = Date.now()
     dutyWatchdog = setTimeout(() => killDuty(`超过 ${dutyTimeoutMin()} 分钟没跑完`), dutyTimeoutMin() * 60_000)
     dutyWatchdog.unref?.()
-    child.on('exit', (code) => {
+    child.on('exit', (code, signal) => {
       releaseRunLock()            // ⭐ 这一轮结束了，把锁放开（删不掉也没事，10 分钟自动过期）
       const startedAt = dutyStartedAt
       if (dutyChild === child) dutyClear()
-      log(`刷B站结束（${why}，code=${code}）`)
+      log(`刷B站结束（${why}，code=${code}${signal ? '，signal=' + signal : ''}）`)
       // ⭐ 2026-10-25：这一轮刚生成的会话，稍等它落盘后归档 —— 别让它占着侧栏「未分组」
       try {
         const t = setTimeout(() => { archiveDutyBucket(startedAt - 5000) }, 1200)
@@ -2341,6 +2466,11 @@ function reportMeta() {
       //    （顺序要紧：先入队写日报，下面那个"今天挑了几条"才数得到它们）
       try { finishQueueRound({ why, code }) } catch { /* finishQueueRound 自己兜住了，这里再兜一层 */ }
       try { writeRoundNotesToReport() } catch { /* 写不进去也不能炸 */ }
+      // ⭐ 工单 07：采集失败（含超时被收掉：code=null + signal）⇒ 一条可读通知。
+      //    正常结束（code 0）不通知；「没找到值得的」也不通知（那是正常结果）。
+      if (code !== 0) {
+        try { notifyCollectionFailure(code, signal) } catch { /* 通知写不进去也不能影响收尾 */ }
+      }
     // ⭐ 2026-10-20：这一轮跑成了、并且使用者选了收藏夹 ⇒ 把挑中的存进去（后台做，别拖住收尾）
     if (code === 0 && Number(cfg.favFolderId) > 0) {
       favToday('auto').catch((error) => log('自动收藏出错（已兜住）：' + String(error?.message ?? error)))
@@ -2418,6 +2548,28 @@ function reportMeta() {
     timer.unref?.()                                    // 别因为这个定时器让进程不肯退出
     ctx.effect(() => () => clearInterval(timer), 'bili-duty: 谷时定时器')
   } catch (e) { log(`定时器没起来：${e?.message ?? e}`) }
+
+  /* ─────────────── 自动投递时钟（工单 07） ───────────────
+   * 60 秒一跳；启动时立即跑一跳（setTimeout 0，**不阻塞 apply**）。
+   * 和上面的谷时定时器同一条规矩：回调里**所有异常都兜住** —— 未捕获异常会杀整个宿主。
+   * 判断逻辑全在 lib/delivery-clock.mjs（可直接测）；这里只接定时器、刷新配置。
+   */
+  try {
+    const deliveryTick = () => {
+      try {
+        refreshCfg()                    // 设置页刚改的间隔 / 免打扰 / 开关立刻生效
+        Promise.resolve(deliveryClock.tick())
+          .catch((e) => log('投递时钟这一跳出错（已兜住，不影响宿主）：' + String(e?.stack ?? e)))
+      } catch (e) {
+        log('投递时钟这一跳出错（已兜住，不影响宿主）：' + String(e?.stack ?? e))
+      }
+    }
+    const deliveryTimer = setInterval(deliveryTick, 60_000)
+    deliveryTimer.unref?.()                                 // 别因为这个定时器让进程不肯退出
+    ctx.effect(() => () => clearInterval(deliveryTimer), 'bili-duty: 投递时钟')
+    const kick = setTimeout(deliveryTick, 0)                // 启动时立即跑一跳，但不阻塞 apply
+    kick.unref?.()
+  } catch (e) { log(`投递时钟没起来：${e?.message ?? e}`) }
 
   // ⭐ 2026-10-21 私信双向（2.0 的主角）：
   //    宿主每 N 分钟**纯代码**查一次私信（不花 token），只有"主人本人"发来新消息时，
@@ -3330,6 +3482,8 @@ function reportMeta() {
       // ⭐ 2026-11 工单 05：投递账的两个最少状态 —— 设置页与 07/09 都读它
       //    deliveredToday 只数「有回执且非 manual」的（口径同 lib/delivery-policy.mjs）
       ...deliveryState(),
+      // ⭐ 工单 07：故障通知（最近几条，新的在前）—— 设置页 10 显示它；「没找到 / 过期」永远不进来
+      notifications: notifier.recent(10),
       // ⭐ 2026-11 工单 06：队列摘要（设置页的「队列」面板 + 07 的水位闸都读它）
       //    queueTotal = 队列文件里的条数（含已投递/已过期，供判重与对账）
       //    queuePending = 还能投递的条数；queueNext = 下一条（没有 = null）
