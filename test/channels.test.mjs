@@ -255,7 +255,7 @@ test('桩宿主：私信关着 ⇒ 采集轮退回「评论 + 日报」—— �
   const p = h.prompt()
   assert.match(p, /私信关着 ⇒ 没有队列/)
   assert.match(p, /每挑中一条.*`### BV号`/)
-  assert.match(p, /私信：\*\*关着\*\*/)
+  assert.match(p, /私信：关着/)
   assert.ok(!p.includes('duty_candidate_append'), '私信关着时提示词里不该出现候选工具：' + p.slice(0, 400))
   assert.ok(!/这一轮是「采集轮」：只挑候选/.test(p), '不该走队列模式那段')
 

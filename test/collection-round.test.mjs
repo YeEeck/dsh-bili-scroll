@@ -285,7 +285,8 @@ test('采集轮的 BILI_MCP_TOOLS 里没有 bili_send_message（私信回复轮�
   assert.match(p, /这一轮\*\*最多挑 3 条\*\*候选/)
   assert.ok(p.includes('duty_candidate_append(bvid, title, up, draft)'))
   assert.ok(!/用 bili_send_message/.test(p), '采集轮的提示词里不该让它去发私信（章程里"这一轮没有这只工具"那句不算）')
-  assert.match(p, /私信：\*\*这一轮一条都不发\*\*/)
+  assert.match(p, /私信：开着/, '开头要说清口径（章程按这句话分支）')
+  assert.match(p, /这一轮\*\*一条私信都不发\*\*/)
 })
 
 /* ───────────────────────── ⑤ 过期：不进可投递视图 ───────────────────────── */
@@ -388,4 +389,103 @@ test('日报的状态看账本：队列还是 pending，但账本里已有回执
   assert.match(blockA, /^- 状态：已投递$/m, '账本有回执 ⇒ 日报说已投递')
   assert.match(blockB, /^- 状态：待投递$/m, '没有回执的照旧说待投递')
   assert.equal(h.readQueue().entries[0].status, 'pending', '队列状态由 07 改；06 只读账本渲染日报')
+})
+
+/* ───────────────── ⑦ spec #31：日报要记「今天发了什么」 ───────────────── */
+
+test('昨天采、今天才投出去的候选：今天的日报里有一条（### BV + 状态：已投递），统计行还在', async () => {
+  const h = startHost()
+  const now = new Date()
+  const yesterday = new Date(now.getTime() - 36 * 3600_000)
+  // 队列里那条是**昨天**采的，保质期还没到；账本里今天才拿到回执
+  h.writeQueueRaw({
+    v: 1,
+    entries: [{
+      id: dayKey(yesterday) + ':' + BVID_A,
+      bvid: BVID_A,
+      title: '昨天采的那条',
+      up: '合成UP',
+      draft: '这条讲得挺清楚，值得花十分钟',
+      collectedAt: yesterday.toISOString(),
+      expiresAt: new Date(now.getTime() + 12 * 3600_000).toISOString(),
+      status: 'pending',
+      attempts: 0,
+      lastError: '',
+      retryAt: '',
+    }],
+  })
+  appendFileSync(join(h.stateDir, 'delivery-ledger.jsonl'), JSON.stringify({
+    at: now.toISOString(), bvid: BVID_A, status: 'sent', msgKey: '合成回执', receiverUid: 12345,
+  }) + '\n', 'utf8')
+
+  await h.round({ body: '' })
+  const t = h.report()
+  assert.equal(headings(t, /^## 队列$/gm), 1, '「队列」一节只出现一次')
+  assert.ok(t.includes('### ' + BVID_A), '昨天采、今天发的也要进今天的日报')
+  assert.ok(t.includes('- 标题：昨天采的那条'))
+  assert.match(t, /^- 状态：已投递$/m)
+  assert.match(t, /^- 本轮：入队 0 条 · 丢弃 0 条 · 过期 0 条 · 跳过 0 条 · 现在队列里 1 条待投递$/m,
+    '末尾统计行别丢')
+})
+
+/* ───────────────── ⑧ spec #33：新投递账接上旧消费者 ───────────────── */
+
+test('新投递账（msgKey）让 /watched 认「发给你了」；旧的 dm-deliveries.jsonl 仍然生效', async () => {
+  const h = startHost()
+  const today = dayKey()
+  // 判重表：今天挑中的两条（旧消费者只看 picked 的那几行）
+  writeFileSync(join(h.stateDir, 'seen.md'), [
+    '# 判重表', '',
+    '| 日期 | BV | 标题 | UP | 状态 |',
+    '|---|---|---|---|---|',
+    `| ${today} | ${BVID_A} | 账本里发过的 | 合成UP | 挑了 |`,
+    `| ${today} | ${BVID_B} | 旧文件里发过的 | 合成UP | 挑了 |`,
+    '',
+  ].join('\n'), 'utf8')
+  // 新账：今天 sent + msgKey（采集轮不再发私信，投递只写这个文件）
+  appendFileSync(join(h.stateDir, 'delivery-ledger.jsonl'), JSON.stringify({
+    at: new Date().toISOString(), bvid: BVID_A, status: 'sent', msgKey: '合成回执', receiverUid: 12345,
+  }) + '\n', 'utf8')
+  // 旧账：mcp_server.py 那份（老用户升级上来时历史都在这里）
+  writeFileSync(join(h.stateDir, 'dm-deliveries.jsonl'),
+    JSON.stringify({ day: today, bvids: [BVID_B] }) + '\n', 'utf8')
+
+  const all = await h.call('GET', '/api/bili-duty/watched')
+  assert.equal(all.ok, true)
+  const row = (bv) => all.rows.find((x) => x.bvid === bv)
+  assert.equal(row(BVID_A).delivered, true, '新投递账里的回执要认')
+  assert.equal(row(BVID_B).delivered, true, '旧文件继续生效（取并集）')
+
+  const only = await h.call('GET', '/api/bili-duty/watched?state=commented')
+  assert.deepEqual(only.rows.map((x) => x.bvid).sort(), [BVID_A, BVID_B].sort(),
+    '「发给你了」那个筛选也要能把它们过滤出来')
+})
+
+/* ───────────────── ⑨ 提示词与章程的接缝（私信口径 + 队列现状） ───────────────── */
+
+test('队列模式：提示词开头写「私信：开着」，并把队列现状（BV · 标题）摆出来', async () => {
+  const h = startHost()
+  await h.round({ candidates: [cand(BVID_A, 'A'), cand(BVID_B, 'B')] })
+  // 第一轮开跑时队列还空着
+  const first = h.prompt()
+  assert.match(first, /私信：开着/)
+  assert.match(first, /现在队列是空的/)
+
+  // 第二轮：宿主把上一轮那两条写进提示词（待投递条数 + 每条 BV · 标题）
+  await h.round({ candidates: [] })
+  const p = h.prompt()
+  assert.match(p, /私信：开着/)
+  assert.match(p, /队列现状/)
+  assert.match(p, /现在有 2 条待投递/)
+  assert.ok(p.includes('- ' + BVID_A + ' · 合成标题 A'), '要列出队列里的 BV/标题')
+  assert.ok(p.includes('- ' + BVID_B + ' · 合成标题 B'))
+})
+
+test('私信关着：提示词开头写「私信：关着」，没有队列现状、也没有候选工具', async () => {
+  const h = startHost({ cfg: { channelDm: false } })
+  await h.round({ body: '## 小结\n这一轮没有值得的。' })
+  const p = h.prompt()
+  assert.match(p, /私信：关着/)
+  assert.ok(!p.includes('duty_candidate_append'), '私信关着时提示词里不该出现候选工具')
+  assert.ok(!p.includes('队列现状'), '私信关着时没有队列，别报队列现状')
 })

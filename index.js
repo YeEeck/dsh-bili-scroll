@@ -1351,7 +1351,8 @@ function reportMeta() {
   const oneLineOf = (s) => String(s ?? '').replace(/\s+/g, ' ').trim()
 
   /**
-   * 日报里的「队列」一节。形状（宿主写、`replaceSect(..., {subheads:true})` 原地替换）：
+   * 日报里的「队列」一节。收录**今天采的**或**今天投递过的**条目（spec #31：日报要记「今天发了什么」）。
+   * 形状（宿主写、`replaceSect(..., {subheads:true})` 原地替换）：
    *
    *   ## 队列
    *
@@ -1372,15 +1373,28 @@ function reportMeta() {
     } catch { /* 账本读不到就当还没回执 */ }
     return set
   }
+  /** ⭐ spec #31：账本里**今天投递过**的 BV（当天的 `at`、带 `msgKey`）——
+   *  「昨天采、今天才发出去」的候选靠它进今天的日报。手动投递也算：它今天真的发出去了。 */
+  const deliveredBvidsOn = (day) => {
+    const set = new Set()
+    try {
+      for (const r of readDelivery(stateDir, { day })) if (r.msgKey) set.add(String(r.bvid || ''))
+    } catch { /* 账本读不到就当今天还没发过 */ }
+    return set
+  }
+  /** 这条候选是哪一天采的（本机时区；collectedAt 认不出来 = ''） */
+  const collectedDayOf = (e) => {
+    const d = e.collectedAt ? new Date(e.collectedAt) : null
+    return d && !Number.isNaN(d.getTime()) ? dayKey(d) : ''
+  }
   const queueSectionBlock = (queue, { at, stats }) => {
     const today = dayKey(at)
-    const delivered = deliveredBvids()   // 队列与账本一起看：队列说 pending、账本有回执 ⇒ 显示已投递
-    // 只列**今天采的**（含已投递 / 已过期）：宿主数的 `### BV` 行就是"今天采了几条"，
-    // 把昨天还pending的也写进来会让 perDay 的账翻倍（09 接管之前先保持这个口径）。
-    const items = queue.entries.filter((e) => {
-      const d = e.collectedAt ? new Date(e.collectedAt) : null
-      return d && !Number.isNaN(d.getTime()) && dayKey(d) === today
-    })
+    const delivered = deliveredBvids()          // 队列与账本一起看：队列说 pending、账本有回执 ⇒ 显示已投递
+    const sentToday = deliveredBvidsOn(today)   // ⭐ spec #31：今天投递过的（含昨天采、今天才发出去的）
+    // 收录「今天采的」**或**「今天投递过的」：只列今天采的会让"昨天采、今天才发出去"的那几条
+    // 在今天的日报里一行都没有（spec #31 / 工单 06）。状态仍然优先看回执。
+    const items = queue.entries.filter((e) => collectedDayOf(e) === today || sentToday.has(e.bvid))
+    const isSent = (bv) => delivered.has(bv) || sentToday.has(bv)
     const view = queueView(queue, { now: at })
     const lines = ['## 队列', '']
     if (!items.length) lines.push('- 今天还没有候选进队。')
@@ -1388,10 +1402,10 @@ function reportMeta() {
       lines.push('### ' + e.bvid)
       lines.push('- 标题：' + (oneLineOf(e.title) || '（没写标题）'))
       lines.push('- UP：' + (oneLineOf(e.up) || '（没写 UP）'))
-      lines.push('- 状态：' + (delivered.has(e.bvid) ? QUEUE_STATUS_TEXT.sent : (QUEUE_STATUS_TEXT[e.status] || e.status)))
+      lines.push('- 状态：' + (isSent(e.bvid) ? QUEUE_STATUS_TEXT.sent : (QUEUE_STATUS_TEXT[e.status] || e.status)))
       lines.push('- 采集：' + clockText(e.collectedAt) + ' · 到期：' + clockText(e.expiresAt))
       const draft = oneLineOf(e.draft)
-      // ⚠️ 草稿里命中内部术语只**标出来**（07 发送前还会再过一遍 checkOutboundText），绝不因此丢候选
+      // ⚠️ 草稿里命中内部术语只**标出来**（07 发送前还会再过一遍出站检查 checkDeliveryText），绝不因此丢候选
       const verdict = draft ? checkOutboundText(draft) : { ok: true, hits: [] }
       const mark = verdict.ok === false ? ' ⚠️（草稿里有内部术语：' + (verdict.hits || []).join('、') + ' —— 发之前要改写）' : ''
       lines.push('- 草稿：' + (draft ? draft.slice(0, 600) + mark : '（这一轮没写草稿）'))
@@ -1402,16 +1416,16 @@ function reportMeta() {
       + ' · 现在队列里 ' + view.pending + ' 条待投递')
     return lines.join('\n')
   }
-  /** 把「队列」一节写进今天的日报（没发生任何事就不写，省得每轮多一个空节） */
+  /** 把「队列」一节写进今天的日报（没发生任何事就不写，省得每轮多一个空节）
+   *  ⭐ spec #31：**今天投递过**也算「发生了事」—— 昨天采、今天才发出去的候选，
+   *  今天的日报里必须有它（不然「今天发了什么」只能去翻账本）。 */
   const writeQueueReport = (queue, { at, stats }) => {
     try {
       if (String(cfg.reportLevel || 'full') === 'off') return   // 「不写日报」那档就不写
       const today = dayKey(at)
-      const hasToday = queue.entries.some((e) => {
-        const d = e.collectedAt ? new Date(e.collectedAt) : null
-        return d && !Number.isNaN(d.getTime()) && dayKey(d) === today
-      })
-      if (!hasToday && !stats.enqueued && !stats.dropped && !stats.expired) return
+      const sentToday = deliveredBvidsOn(today)
+      const touchesToday = queue.entries.some((e) => collectedDayOf(e) === today || sentToday.has(e.bvid))
+      if (!touchesToday && !stats.enqueued && !stats.dropped && !stats.expired) return
       const block = queueSectionBlock(queue, { at, stats })
       const f = join(outDir, today + '.md')
       if (!existsSync(f)) { writeFileSync(f, '# 刷B站 · ' + today + '\n\n' + block + '\n', 'utf8'); return }
@@ -1794,7 +1808,32 @@ function reportMeta() {
     } else if (!cfg.channelComment) {
       roundNotes.push('投递：只私信（已找到收件人）')
     }
-    return `你是这个账号的 B站 助手。`
+    /** ⭐ 工单 06/08 接缝：队列模式下把「队列现状」摆给这一轮看 ——
+     *  待投递几条 + 每条 `BV · 标题`（最多列到 queueLimit 条；空队列也要说一句，
+     *  否则模型会以为"宿主手上还有货"、把这一轮的候选写成接续上一轮的上下文）。 */
+    const queueNowText = () => {
+      if (!queueMode) return ''
+      try {
+        const { queue } = queueSnapshot()
+        const view = queueView(queue, { now: new Date() })
+        if (view.pending <= 0) return '\n\n**队列现状**：现在队列是空的（这一轮采到的就是头几条）。'
+        const cap = Math.max(1, Math.min(queueLimits().limit, QUEUE_LIMIT.max))
+        const shown = view.items.slice(0, cap)
+        const more = view.pending - shown.length
+        return '\n\n**队列现状**：现在有 ' + view.pending + ' 条待投递'
+          + (more > 0 ? '（下面只列前 ' + shown.length + ' 条）' : '') + '：\n'
+          + shown.map((x) => '- ' + x.bvid + ' · ' + (oneLineOf(x.title) || '（没写标题）')).join('\n')
+      } catch (e) {
+        log('读队列现状失败（提示词里省略这一段）：' + String(e?.message ?? e))
+        return ''
+      }
+    }
+    return `你是这个账号的 B站 助手。私信：${queueMode ? '开着' : '关着'}`
+      // ⭐ 工单 04/08 接缝：章程开头按「私信开着 / 私信关着」分支 —— 提示词**开头必须真的说这句话**，
+      //    否则那两行分支条件永远没人满足（以前只写"这一轮一条都不发"，模型两边都读不到口径）。
+      + (queueMode
+        ? `（就是章程里「私信开着」那条口径：这一轮只挑候选、写账；发送由宿主按队列来）。`
+        : `（就是章程里「私信关着」那条口径：这一轮不建队列、不投递，产出就是日报和可选的公开评论）。`)
       + (ownerDoc
         ? `下面是使用者的人设（**唯一**的人格来源）—— 按它来，别用你默认那套人格。`
         : `⭐ 这一轮**没有**可用的人设（「人设提示词」空着 / 没读到，工作区里也没有 AGENTS.md）⇒ **按中性说话**：别扮演任何人、也别自己编一套设定；**这一轮不公开说话**（不发评论），${queueMode ? '候选照采' : '照常挑、写日报'}。`)
@@ -1811,6 +1850,7 @@ function reportMeta() {
           + `这一轮**最多挑 ${batch} 条**候选（挑够就收，别多要）。`
           + `队列上限 ${queueCap} 条 —— 满了的话这一轮多出来的候选进不来（宿主会把丢了哪几条记下来）。`
           + (already > 0 ? `今天已经进队 ${already} 条了。` : '')
+          + queueNowText()
           + (isManual
             ? '\n\n⭐ **这一轮是「手动触发」的采集**：只为"现在就想多攒两条"，挑够就收，别把全天要看的量一次挑光。'
             : '')
@@ -1880,9 +1920,10 @@ function reportMeta() {
         ? `开着的（每轮最多 ${cfg.commentPerRound} 条评论，每条在正文里纯文本 @ ${cfg.mentionName}，150 字内）`
         : `关着的 —— ${commentState.reason}。**这一轮别发公开评论**（把账记清楚就行）`}。`
       // ⭐⭐ 工单 06/08：发送权归宿主 —— 采集轮没有 bili_send_message，也不该在正文里假装发了。
+      //    （开头的「私信：开着 / 关着」是口径标记，这里说清这一轮**到底发不发**。）
       + (queueMode
-        ? `\n\n私信：**这一轮一条都不发**（这一轮也没有那只工具）—— 发送由宿主按队列来，你不用管。`
-        : `\n\n私信：**关着** —— 这一轮不入队、不投递、也不发任何私信；产出就是这份日报（和可选的公开评论）。`)
+        ? `\n\n⭐ 这一轮**一条私信都不发**（这一轮也没有那只工具）—— 发送由宿主按队列来，你不用管。`
+        : `\n\n⭐ 这一轮**不入队、不投递、也不发任何私信** —— 产出就是这份日报（和可选的公开评论）。`)
       // ⭐⭐ 2026-10-25 修 + 工单 08：没有评论通道时白名单**不给** bili_reply，
       //    提示词也必须说"这一轮不做"，别让它拿着指令却没有工具、记一行"工具集里没有"。
       + '\n\n'
@@ -3151,7 +3192,7 @@ function reportMeta() {
     const file = join(stateDir, 'seen.md')
     let text = ''
     try { text = readFileSync(file, 'utf8') } catch { return [] }
-    // 只有值班轮中收到 B 站投递回执的 BV 才记为已私信。
+    // 只有收到 B 站投递回执的 BV 才记为已私信。
     const dmDelivered = new Set()
     try {
       for (const line of readFileSync(join(stateDir, 'dm-deliveries.jsonl'), 'utf8').split(/\r?\n/)) {
@@ -3164,6 +3205,18 @@ function reportMeta() {
         } catch { /* 跳过空行或损坏的记录 */ }
       }
     } catch { /* 尚未发送过私信 */ }
+    /* ⭐ spec #33（新投递账要接上旧消费者）：采集轮已不发私信，投递只写
+     *   `delivery-ledger.jsonl` ⇒ 旧文件可能是空的。带 `msgKey` 的记录才算"真到了"，
+     *   按 `at` 的 dayKey 归到那一天，与旧文件**取并集**（旧文件保留不动，老用户的历史照旧生效）。 */
+    try {
+      for (const r of readDelivery(stateDir)) {
+        if (!r.msgKey) continue
+        const d = new Date(r.at)
+        const bv = String(r.bvid || '')
+        if (Number.isNaN(d.getTime()) || !/^BV[0-9A-Za-z]{10}$/.test(bv)) continue
+        dmDelivered.add(`${dayKey(d)}@${bv}`)
+      }
+    } catch { /* 账本读不到就当还没有回执 */ }
     const out = []
     const seen = new Set()
     let bad = 0

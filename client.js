@@ -903,7 +903,9 @@ function WatchTab() {
         }, msg) : null,
 
         h('div', { 'data-bd-row': '' },
-          h('span', { 'data-bd-badge': '' }, `今天已挑 ${st.autoPicked ?? st.pickedToday ?? 0} / ${cfg.perDay} 条` + ((st.manualExtra > 0) ? ` · 手动 ${st.manualExtra} 条` : '')),
+          // ⭐ 工单 10：顶部徽章只报「今天真的发出去几条 / 每天上限」—— 口径由宿主算好（/status.deliveredToday，
+          //    含升级首日的基线）；旧的「今天已挑 N / perDay」既没有设置入口、也不驱动任何闸，别再摆出来。
+          h('span', { 'data-bd-badge': '' }, `已投递 ${st.deliveredToday ?? 0} / ${cfg.deliverPerDay ?? 0} 条`),
           h('span', { 'data-bd-badge': '' }, '环境' + (st.venvReady ? '已就绪' : (st.installing ? '正在装' : '未装'))),
           h('span', { 'data-bd-badge': '' }, st.loggedIn ? 'B站已登录' : 'B站未登录'),
           h('span', { 'data-bd-badge': '' }, 'v' + (st.version || '?')),
@@ -1286,6 +1288,13 @@ function WatchTab() {
             '字数：' + String(persona ?? '').length
             + (String(persona ?? '').length > 40000 ? '（⚠️ 超过 40000，超出的部分不会生效）' : '')
             + (String(persona ?? '').length > 60000 ? '（⚠️ 超过 60000，保存时会被截断）' : '')),
+          // ⭐ 代码审查收尾：人设来自**文件路径**时框里放的是路径、上面那行字数说明不适用 ——
+          //    但宿主照样会截到 40000 ⇒ 直接报 /status 里的解析结果（personaLength / personaTruncated），
+          //    否则用户会以为"文件里写的全都生效了"。
+          (st.personaTruncated === true && st.personaSource !== 'text')
+            ? h('div', { 'data-bd-note': '', 'data-warn': '' },
+              '⚠️ 人设来自文件，已截到 ' + Number(st.personaLength || 0) + ' 字（超出的部分不会生效）。')
+            : null,
           h('div', { 'data-bd-note': '' },
             (st.personaFromWs && String(persona || '').trim() === '')
               ? '你现在还是用「工作区」里那份 AGENTS.md 说话的（照旧生效）。想把它搬到这儿改，就把上面的路径填成本机那个目录。'

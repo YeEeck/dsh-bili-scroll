@@ -54,7 +54,7 @@ const entry = (bvid, extra = {}) => ({
   bvid,
   title: '合成标题 ' + bvid,
   up: '合成UP',
-  draft: '这条讲得挺清楚，值得花十分钟 ' + bvid,
+  draft: '这条讲得挺清楚，值得花十分钟 https://www.bilibili.com/video/' + bvid,
   collectedAt: new Date().toISOString(),
   expiresAt: new Date(Date.now() + 24 * 3600_000).toISOString(),
   status: 'pending',
@@ -261,6 +261,26 @@ test('POST /deliver-now：成功 ⇒ 发队头、账本记 manual、队列改 se
   assert.equal(st.lastDelivery.manual, true)
   assert.equal(st.deliveredToday, 0, '手动投递不占当日额度')
   assert.equal(st.queueEmpty, false, '队列里还有 B 待投递')
+})
+
+/* ───────────── ④b 手动投递也走出站检查（链接 / 长度）：被挡下就不进 MCP ───────────── */
+
+test('POST /deliver-now：病态长的草稿 ⇒ 挡在发送之前（账本记 blocked、不起 MCP、这条标 failed）', async () => {
+  const h = startHost()
+  // 链接由 deliveryTextOf 兜底补上，所以宿主这条链上真正会被拦的是「病态长」那一档
+  h.putQueue([entry(BVID_A, { draft: '这条讲得挺清楚。'.repeat(400) })])
+  const r = await h.deliverNow()
+  assert.equal(r.sent, false)
+  assert.equal(r.status, 'blocked')
+  assert.equal(r.reason, 'sent-failed', 'blocked 重试也不会好 ⇒ 直接放弃这条')
+  assert.match(r.message, /异常长/)
+
+  const ledger = h.ledger()
+  assert.equal(ledger.length, 1, 'blocked 也要落一条账')
+  assert.equal(ledger[0].status, 'blocked')
+  assert.equal(ledger[0].bvid, BVID_A)
+  assert.equal(existsSync(join(h.stateDir, 'fake-mcp-stats.json')), false, '没通过检查就不该起 MCP')
+  assert.equal(h.readQueue()[0].status, 'failed')
 })
 
 /* ───────────── ⑤ 手动投递：失败映射（放弃 / 5 分钟后重试） ───────────── */
