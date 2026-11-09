@@ -305,7 +305,6 @@ function WatchTab() {
       const [replyPer, setReplyPer] = React.useState(null)
       const [dmUid, setDmUid] = React.useState(null)        // 私信收件人 UID（本地草稿）
       const [dmWatch, setDmWatch] = React.useState(null)          // 私信双向开关
-      const [dmMode, setDmMode] = React.useState(null)      // 投递方式：off / only / both
       const [mention, setMention] = React.useState(null)
       const [mProv, setMProv] = React.useState(null)      // 手填模型的 provider（只在读不到模型列表时露出来）
       const [mName, setMName] = React.useState(null)      // 手填模型的 model id
@@ -349,7 +348,6 @@ function WatchTab() {
         if (cfg && mProv === null) setMProv(cfg.modelProvider || '')
         if (cfg && mName === null) setMName(cfg.modelName || '')
         if (cfg && dmUid === null) setDmUid(cfg.dmUid ? String(cfg.dmUid) : '')
-        if (cfg && dmMode === null) setDmMode(cfg.dmMode || 'only')
         if (cfg && dmWatch === null) setDmWatch(cfg.dmWatch !== false)   // 2.0 起默认开
         if (cfg && favId === null) setFavId(String(cfg.favFolderId ?? 0))
         if (cfg && excl === null) setExcl((cfg.excludeWords || []).join('\n'))
@@ -651,6 +649,8 @@ function WatchTab() {
 
       // 点了先变，别等网络回来（宿主写 DSH 设置那一步可能要几百毫秒）
       const sw = (k) => Boolean(k in optim ? optim[k] : cfg[k])
+      // ⭐ 工单 08：人设留空 ⇒ 公开评论不可用（置灰 + 说原因；**不改用户存的值**，行为和 UI 按不可用处理）
+      const personaMissing = Boolean(st && st.personaPresent === false)
 
       /* ⭐ 2026-10-23：模型下拉 —— 值用 `provider|model` 拼成一个字符串，
        *    这样「跟随当前会话」（空值）和"钉死某一个"用同一个 select 就能表达。 */
@@ -841,14 +841,23 @@ function WatchTab() {
         /* ── 发言与转写 ── */
         h('div', { 'data-bd-sec': '', 'data-bd-group': 'social', 'data-bd-away': tab === 'social' ? undefined : '' },
           h('div', { 'data-bd-h': '' }, '它怎么把结果给你'),
-          h('div', { 'data-bd-label': '' }, '投递方式'),
-          h('select', {
-            'data-bd-input': '', value: dmMode ?? 'only',
-            onChange: (e) => { setDmMode(e.target.value); patch({ dmMode: e.target.value }, '投递方式') },
-          },
-            h('option', { value: 'only' }, '只发私信 —— 一条公开评论都不发（默认，最不打扰别人）'),
-            h('option', { value: 'off' }, '只发评论 —— 在视频下面 @ 你（公开，别人也看得见）'),
-            h('option', { value: 'both' }, '私信 + 评论 —— 两边都发')),
+          h(ToggleRow, {
+            label: '私信发给我',
+            note: '默认开。采集轮只把候选攒进队列，宿主按它一条一条私信发给你。关掉 = 不建队列、不投递，采集轮退回写日报。',
+            on: sw('channelDm'),
+            onChange: (v) => patch({ channelDm: v }, '私信'),
+          }),
+          h(ToggleRow, {
+            label: '在视频下公开评论 @ 我',
+            note: personaMissing
+              ? '人设留空时不会公开说话 —— 先填「人设提示词」，这个开关才能生效。'
+              : '公开，别人也看得见。人设留空时不会公开说话。',
+            on: sw('channelComment'),
+            disabled: personaMissing,
+            onChange: (v) => patch({ channelComment: v }, '公开评论'),
+          }),
+          (personaMissing && sw('channelComment')) ? h('div', { 'data-bd-note': '' },
+            '「公开评论」存着是开，但现在不会发：' + (st.commentBlockedReason || '人设留空')) : null,
           h('div', { 'data-bd-label': '' }, '发给谁 / @ 谁（B站 昵称）'),
           h('input', {
             'data-bd-input': '', value: mention ?? '',
@@ -856,17 +865,11 @@ function WatchTab() {
             onChange: (e) => setMention(e.target.value),
             onBlur: () => { const v = String(mention || '').trim(); setMention(v); patch({ mentionName: v }, '发给谁') },
           }),
-          (dmMode && dmMode !== 'off') ? h('div', { 'data-bd-note': '' }, '私信会发给他（用昵称自动查一次 UID）；查不到就改回只发评论，不会一条都不送。') : null,
-          (dmMode && dmMode !== 'off') ? h('div', { 'data-bd-note': '' }, '私信内容 = 本轮每条的「标题 + 链接 + 一句话」，一轮合并成一条发。⚠️ 建议先让这个号和收件人互关：B站 对「陌生人私信」会限流，还可能不弹提醒。') : null,
+          sw('channelDm') ? h('div', { 'data-bd-note': '' }, '私信会发给他（用昵称自动查一次 UID；查不到就先攒着，不会一条都不送）。') : null,
+          sw('channelDm') ? h('div', { 'data-bd-note': '' }, '私信内容 = 队列里的一条视频 + 一段按人设写好的草稿；一条一条发，不打包。⚠️ 建议先让这个号和收件人互关：B站 对「陌生人私信」会限流，还可能不弹提醒。') : null,
 
-          (dmMode === 'off' || dmMode === 'both') ? h('div', { 'data-bd-sep': '' }) : null,
-          (dmMode === 'off' || dmMode === 'both') ? h(ToggleRow, {
-            label: '自动评论并 @ 你',
-            note: '开了之后它会在挑中的视频下面留评论，并 @ 上面那个人',
-            on: sw('autoComment'),
-            onChange: (v) => patch({ autoComment: v }, '自动评论'),
-          }) : null,
-          (dmMode === 'off' || dmMode === 'both') && sw('autoComment') ? h('div', { 'data-bd-sub': '' },
+          sw('channelComment') ? h('div', { 'data-bd-sep': '' }) : null,
+          sw('channelComment') ? h('div', { 'data-bd-sub': '' },
             h('div', { 'data-bd-row': '' },
               h('div', { 'data-bd-grow': '' },
                 h('div', { 'data-bd-label': '' }, '每轮最多发几条评论'),
@@ -877,7 +880,7 @@ function WatchTab() {
                 onChange: (e) => setPerRound(e.target.value),
                 onBlur: () => { const n = Math.max(0, Math.min(Number(perRound) || 0, 20)); setPerRound(String(n)); patch({ commentPerRound: n }, '每轮发几条评论') },
               }))) : null,
-          (dmMode === 'off' || dmMode === 'both') && sw('autoComment') ? h('div', { 'data-bd-sub': '' },
+          sw('channelComment') ? h('div', { 'data-bd-sub': '' },
             h('div', { 'data-bd-row': '' },
               h('div', { 'data-bd-grow': '' },
                 h('div', { 'data-bd-label': '' }, '评论写多长'),
@@ -889,13 +892,13 @@ function WatchTab() {
                 h('option', { value: 'short' }, '短'),
                 h('option', { value: 'medium' }, '中'),
                 h('option', { value: 'long' }, '长')))) : null,
-          (dmMode === 'off' || dmMode === 'both') ? h(ToggleRow, {
+          sw('channelComment') ? h(ToggleRow, {
             label: '回复评论（只回楼中楼）',
             note: '开了之后它只回「直接回复到你那条评论下面的人」，不参与讨论',
             on: sw('replyToComments'),
             onChange: (v) => patch({ replyToComments: v }, '回复评论'),
           }) : null,
-          (dmMode === 'off' || dmMode === 'both') && sw('replyToComments') ? h('div', { 'data-bd-sub': '' },
+          sw('channelComment') && sw('replyToComments') ? h('div', { 'data-bd-sub': '' },
             h('div', { 'data-bd-row': '' },
               h('div', { 'data-bd-grow': '' },
                 h('div', { 'data-bd-label': '' }, '每轮最多回几条'),
