@@ -1130,6 +1130,11 @@ function WatchTab() {
             onChange: (e) => setMention(e.target.value),
             onBlur: () => { const v = String(mention || '').trim(); setMention(v); patch({ mentionName: v }, '发给谁') },
           }),
+          (String(mention || '').trim() && sw('channelDm'))
+            ? h('div', { 'data-bd-note': '' }, Number(st.dmUidResolved) > 0
+              ? '已按昵称查到 UID ' + Number(st.dmUidResolved) + ' —— 投递就用它（不用再填 UID）。'
+              : '还没查到 UID：保存这一项后会自动查一次（要已登录 B站）；查不到就先攒着，不会丢。')
+            : null,
           sw('channelDm') ? h('div', { 'data-bd-note': '' }, '私信会发给他（用昵称自动查一次 UID；查不到就先攒着，不会一条都不送）。⚠️ 建议先让这个号和收件人互关：B站 对「陌生人私信」会限流，还可能不弹提醒。') : null),
 
         h('div', { 'data-bd-sec': '', 'data-bd-group': 'social', 'data-bd-away': tab === 'social' ? undefined : '' },

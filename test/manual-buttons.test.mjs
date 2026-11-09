@@ -225,6 +225,30 @@ test('POST /deliver-now：私信关着 / 没填收件人 ⇒ 各自说清，不�
   assert.equal(h.ledger().length, 0, '没发出去就不该有账')
 })
 
+/* ───────────── ③b 只填昵称（真机反馈）：投递照样发得出去 ───────────── */
+
+test('POST /deliver-now：只填昵称 ⇒ 按 uid-cache 解析收件人后照发', async () => {
+  const h = startHost({ cfg: { dmUid: 0, mentionName: 'YeEeck' } })
+  // 预置 UID 缓存 ⇒ resolveUid 直接命中，不联网（这个测试的 fetch 会直接抛）
+  writeFileSync(join(h.stateDir, 'uid-cache.json'), JSON.stringify({ YeEeck: 6591715 }))
+  h.putQueue([entry(BVID_A)])
+
+  const r = await h.deliverNow()
+  assert.equal(r.sent, true, JSON.stringify(r))
+  assert.equal(h.ledger()[0].receiverUid, 6591715)
+  assert.equal((await h.status()).dmUidResolved, 6591715)
+})
+
+test('POST /config：保存昵称后当场解析 UID，/status 与保存响应都能读出来', async () => {
+  const h = startHost({ cfg: { dmUid: 0, mentionName: '' } })
+  writeFileSync(join(h.stateDir, 'uid-cache.json'), JSON.stringify({ YeEeck: 6591715 }))
+
+  const r = await h.config({ mentionName: 'YeEeck' })
+  assert.equal(r.ok, true, JSON.stringify(r))
+  assert.equal(r.dmUidResolved, 6591715)
+  assert.equal((await h.status()).dmUidResolved, 6591715)
+})
+
 /* ───────────── ④ 手动投递：成功（队头一条 + 账本 manual + 不占当日额度 + 防连点） ───────────── */
 
 test('POST /deliver-now：成功 ⇒ 发队头、账本记 manual、队列改 sent；紧接着再点被防连点挡住', async () => {

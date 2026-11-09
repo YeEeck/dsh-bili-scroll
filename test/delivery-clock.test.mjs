@@ -76,7 +76,7 @@ function seq(values, fallback = 0) {
  * 起一个投递时钟：sendPrivate 是桩，会像真的一样往投递账里写一条（成功带 msgKey）。
  * mode 可随时改：ok / fail / blocked / error / busy。
  */
-function makeClock({ dir, cfg = {}, nowRef, random = seq([], 0), mode = 'ok' } = {}) {
+function makeClock({ dir, cfg = {}, nowRef, random = seq([], 0), mode = 'ok', resolveRecipient = null } = {}) {
   const calls = []
   const logs = []
   const refreshed = []
@@ -126,6 +126,7 @@ function makeClock({ dir, cfg = {}, nowRef, random = seq([], 0), mode = 'ok' } =
     now: nowRef,
     random,
     sendPrivate,
+    resolveRecipient,
     log: (m) => logs.push(String(m)),
     onQueueChanged: (queue, when) => refreshed.push({ queue, at: when.toISOString() }),
   })
@@ -574,6 +575,97 @@ test('deliverPerDay=0 ⇒ 不自动投递；没有收件人 ⇒ 也不发', asyn
   r = await h.clock.tick()
   assert.equal(r.reason, 'no-recipient')
   assert.equal(h.calls.length, 0)
+})
+
+test('只填昵称（dmUid=0）⇒ 用 resolveRecipient 解析出的 UID 投递', async () => {
+  const dir = newDir()
+  const now = at(10, 0)
+  putQueue(dir, [entry(A, now)])
+  let asked = 0
+  const h = makeClock({
+    dir,
+    cfg: { dmUid: 0 },
+    nowRef: () => now,
+    resolveRecipient: async () => { asked++; return 987654 },
+  })
+  const r = await h.clock.tick()
+  assert.equal(r.sent, true, JSON.stringify(r))
+  assert.equal(asked, 1, '没填 UID ⇒ 必须问一次昵称解析')
+  assert.equal(h.calls[0].receiverUid, 987654)
+})
+
+test('昵称查不到 ⇒ no-recipient，不发；填了 UID 就不必去查', async () => {
+  const dir = newDir()
+  const now = at(10, 0)
+  putQueue(dir, [entry(A, now)])
+  let asked = 0
+  let h = makeClock({
+    dir,
+    cfg: { dmUid: 0 },
+    nowRef: () => now,
+    resolveRecipient: async () => { asked++; return 0 },
+  })
+  let r = await h.clock.tick()
+  assert.equal(r.reason, 'no-recipient')
+  assert.equal(h.calls.length, 0, '查不到收件人 ⇒ 一条都不发')
+  assert.equal(asked, 1)
+
+  const dir2 = newDir()
+  putQueue(dir2, [entry(A, now)])
+  asked = 0
+  h = makeClock({
+    dir: dir2,
+    cfg: { dmUid: 12345 },
+    nowRef: () => now,
+    resolveRecipient: async () => { asked++; return 999 },
+  })
+  r = await h.clock.tick()
+  assert.equal(r.sent, true, JSON.stringify(r))
+  assert.equal(asked, 0, '填了 UID 就不该再打昵称接口')
+})
+
+test('「现在投递」同样认昵称解析出来的 UID', async () => {
+  const dir = newDir()
+  const now = at(10, 0)
+  putQueue(dir, [entry(A, now)])
+  let asked = 0
+  const h = makeClock({
+    dir,
+    cfg: { dmUid: 0 },
+    nowRef: () => now,
+    resolveRecipient: async () => { asked++; return 24680 },
+  })
+  const r = await h.clock.deliverNow()
+  assert.equal(r.sent, true, JSON.stringify(r))
+  assert.equal(asked, 1)
+  assert.equal(h.calls[0].receiverUid, 24680)
+})
+
+test('手动投递不重排自动节奏：手动发完，下一跳仍按原间隔等', async () => {
+  const dir = newDir()
+  const t0 = at(10, 0)
+  putQueue(dir, [entry(A, t0), entry(B, t0)])
+  // 自动节奏：上一条在 t0 发的，下一条要等满 120 分钟
+  writeFileSync(deliveryClockPaths(dir).state, JSON.stringify({
+    lastDelivery: { at: t0.toISOString(), intervalMs: 120 * 60_000 },
+  }))
+  const nowRef = { value: new Date(t0.getTime() + 5 * 60_000) }
+  const h = makeClock({ dir, cfg: { deliverMinGapMin: 120, deliverMaxGapMin: 120 }, nowRef: () => nowRef.value })
+
+  const manual = await h.clock.deliverNow()
+  assert.equal(manual.sent, true, JSON.stringify(manual))
+  const afterManual = readJsonFile(deliveryClockPaths(dir).state)
+  assert.equal(afterManual.lastDelivery.at, t0.toISOString(), '手动投递不能改写自动节奏的锚点')
+  assert.equal(afterManual.lastDelivery.intervalMs, 120 * 60_000, '手动投递不能把间隔归零')
+
+  const soon = await h.clock.tick()
+  assert.equal(soon.reason, 'too-soon', '手动发完 5 分钟，自动这一跳还不该发')
+  assert.equal(h.calls.length, 1)
+
+  nowRef.value = new Date(t0.getTime() + 121 * 60_000)
+  const auto = await h.clock.tick()
+  assert.equal(auto.sent, true, JSON.stringify(auto))
+  assert.equal(h.calls.at(-1).bvid, B)
 })
 
 test('私信关着 ⇒ 整跳直接返回，不读队列也不写文件', async () => {

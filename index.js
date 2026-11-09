@@ -1128,6 +1128,8 @@ function reportMeta() {
       if (r.state === 'ok') {
         const file = saveCredential(stateDir, r.credential)
         log(`登录成功，凭证已写入 ${file}`)
+        // ⭐ 2026-11-10：之前"没登录 ⇒ 查不到昵称 UID"的失败冷却要清掉 —— 登录完立刻能再查
+        resetDmUidCache()
         return { ok: true, state: 'ok', file }
       }
       return { ok: r.state !== 'unknown', state: r.state, code: r.code, message: r.message }
@@ -1468,6 +1470,7 @@ function reportMeta() {
     cfg,
     now: () => new Date(),
     sendPrivate,
+    resolveRecipient: warmDmUid,   // ⭐ 2026-11-10：只填昵称也要能投递（见 warmDmUid 上面的注释）
     log,
     notifier,
     onQueueChanged: refreshQueueReport,
@@ -1732,17 +1735,27 @@ function reportMeta() {
 
   // ⭐ 私信默认化（2026-10-21）：用户常常只填了「@ 谁」的昵称、没填 UID
   //    ⇒ 我们按昵称替他查一次 mid 并缓存；**查不到就降级回只发评论**（绝不能"默认私信"却一条都送不出去 ✗）
+  // ⭐ 2026-11-10（真机反馈）：3.0.0 的投递时钟只看 cfg.dmUid ⇒ 只填昵称的用户永远报 no-recipient。
+  //    现在投递时钟会调这个函数（resolveRecipient），缓存按「昵称」失效；失败冷却 5 分钟，
+  //    免得每 60 秒打一次搜索接口；登录成功后清缓存，立刻能再试。
   let dmUidCache = 0
-  async function warmDmUid() {
+  let dmUidCacheName = ''
+  let dmUidFailedAt = 0
+  const DM_UID_RETRY_MS = 5 * 60 * 1000
+  const resetDmUidCache = () => { dmUidCache = 0; dmUidCacheName = ''; dmUidFailedAt = 0 }
+  async function warmDmUid({ force = false } = {}) {
     if (Number(cfg.dmUid) > 0) return Number(cfg.dmUid)
     if (!cfg.channelDm) return 0       // ⭐ 工单 08：私信关着就不用去查 UID 了
     const name = String(cfg.mentionName || '').trim()
-    if (!name) return 0
+    if (!name) { resetDmUidCache(); return 0 }
+    if (dmUidCacheName !== name) { dmUidCache = 0; dmUidFailedAt = 0; dmUidCacheName = name }
+    if (dmUidCache > 0) return dmUidCache
+    if (!force && dmUidFailedAt && Date.now() - dmUidFailedAt < DM_UID_RETRY_MS) return 0
     try {
       const mid = await resolveUid(stateDir, name, log)
-      if (mid > 0) { dmUidCache = mid; log(`私信对象：${name} → ${mid}`) }
+      if (mid > 0) { dmUidCache = mid; dmUidFailedAt = 0; log(`私信对象：${name} → ${mid}`) } else { dmUidFailedAt = Date.now() }
       return mid
-    } catch (e) { log('查私信 UID 出错：' + String(e?.message ?? e)); return 0 }
+    } catch (e) { dmUidFailedAt = Date.now(); log('查私信 UID 出错：' + String(e?.message ?? e)); return 0 }
   }
 
   const promptFor = (why = 'auto') => {
@@ -3733,7 +3746,7 @@ function reportMeta() {
       case 'dm-off':
         return '私信关着，不投递（在设置里打开「私信发给我」）'
       case 'no-recipient':
-        return '还没填收件人（设置里的「私信发给谁」/ UID），查不到就不发'
+        return '还没填收件人（设置里的「私信发给谁」/ UID 或 B站 昵称），查到的就发、查不到先攒着'
       case 'locked':
       case 'busy':
         return '另一个宿主正在投递 —— 等几秒再点'
@@ -3917,10 +3930,15 @@ function reportMeta() {
       if ('dmUid' in patch) patch.dmUid = Math.max(0, Math.min(Number(patch.dmUid) || 0, Number.MAX_SAFE_INTEGER))
       const { clean, host } = await persistCfg(patch)
       log(`设置已更新：${JSON.stringify(clean)}（DSH 那边${host.ok ? '已同步' : '没写成：' + host.error}）`)
+      // ⭐ 2026-11-10：昵称 / UID / 私信开关一改就重查一次收件人 —— 保存完设置页立刻能说「查到了没」。
+      //    查不到不报错（网络 / 未登录 / 重名），投递时钟那边还有 5 分钟冷却的再试。
+      if ('mentionName' in patch || 'dmUid' in patch || 'channelDm' in patch) resetDmUidCache()
+      const wantRecipient = Number(cfg.dmUid) <= 0 && cfg.channelDm && String(cfg.mentionName || '').trim() !== ''
+      const dmUidResolved = wantRecipient ? await warmDmUid({ force: true }) : (Number(cfg.dmUid) || 0)
       // ⭐ 工单 08：`channelComment` 存归存；人设留空时**读取时视为关**，把真实可用性与原因一并交回
       const cs = commentStateOf(personaNow())
       return sendJson(res, 200, {
-        ok: true, config: cfg, host,
+        ok: true, config: cfg, host, dmUidResolved,
         channelDm: Boolean(cfg.channelDm), channelComment: Boolean(cfg.channelComment),
         commentAvailable: cs.available, commentBlockedReason: cs.reason,
       })
@@ -3956,7 +3974,9 @@ function reportMeta() {
     //    返回值带账本那条记录（07/09 据此判断 sent / no-receipt / failed / error / busy）。
     if (req.method === 'POST' && path === '/api/bili-duty/deliver') {
       const body = await readBody(req)
-      const uid = Number(body.uid) > 0 ? Number(body.uid) : Number(cfg.dmUid) || 0
+      const uid = Number(body.uid) > 0
+        ? Number(body.uid)
+        : (Number(cfg.dmUid) > 0 ? Number(cfg.dmUid) : await warmDmUid())
       const manual = body.manual === true || body.manual === 'true'
       const result = await sendPrivate({
         receiverUid: uid,
