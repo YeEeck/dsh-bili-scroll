@@ -164,6 +164,10 @@ export const Config = !z ? undefined : z.object({
   /** 只回这个 UID（0 = 用「私信发给谁」那个） */
   dmOwnerUid: z.natural().default(0).extra('volatile', true),
   workspace: z.string().default('').extra('volatile', true),
+  /** ⭐ 2026-11-10：会话头「刷过的视频」tab 的显示开关（默认开）。
+   *  关掉只影响**对话页顶部那一栏** —— 设置页里的历史列表、`/watched`、封面代理照旧。
+   *  判据在客户端（见 client.js 的 ScopeProbe），宿主只通过 /session-scope 交回这个值。 */
+  showWatchTab: z.boolean().default(true).extra('volatile', true),
   /** 日报形态：full=完整（现状）· brief=每条一两行 · off=不写报告（只发评论） */
   reportLevel: z.string().default('full').extra('volatile', true),
   /** 回复评论：默认关。开了之后只回「直接回复到它那条评论下面的人」 */
@@ -338,6 +342,8 @@ function reportMeta() {
     // ⭐ 工单 08：两个渠道开关（dmMode / autoComment 只留给一次性迁移读，行为不看它们）
     channelDm: true, channelComment: false,
     keywords: [], commentPerRound: 1, mentionName: '', pythonPath: 'python', dshBin: '', headlessProfile: 'headless', overlayMcp: true, workspace: '', reportLevel: 'full', replyToComments: false, replyPerRound: 1, favFolderId: 0,
+    // ⭐ 2026-11-10：会话头「刷过的视频」tab 开关 —— 默认开（升级后行为不变）；关掉只影响对话页那一栏
+    showWatchTab: true,
     // ⭐ 2.3.0：手动轮 / 抓取量 / 排除词 / 评论长度 —— 少一项 normalize 就会把用户存的值丢掉
     manualMax: 3, manualCooldownMin: 3, searchSort: 'pubdate', searchPages: 2, fetchPerRound: 8, excludeWords: [], commentLength: 'medium',
     modelProvider: '', modelName: '', runTimeoutMinutes: 20,
@@ -392,6 +398,8 @@ function reportMeta() {
     if ('dmWatch' in p) p.dmWatch = Boolean(p.dmWatch)
     if ('channelDm' in p) p.channelDm = Boolean(p.channelDm)
     if ('channelComment' in p) p.channelComment = Boolean(p.channelComment)
+    // ⭐ 2026-11-10：会话头 tab 开关 —— 写与读两头都收敛成布尔（同 channelDm 这些）
+    if ('showWatchTab' in p) p.showWatchTab = Boolean(p.showWatchTab)
     if ('dmWatchMinutes' in p) p.dmWatchMinutes = Math.max(1, Math.min(120, Number(p.dmWatchMinutes) || 1))
     if ('dmReplyPerDay' in p) p.dmReplyPerDay = Math.max(0, Math.min(20, Number(p.dmReplyPerDay) || 0))
     if ('dmOwnerUid' in p) p.dmOwnerUid = Math.max(0, Number(p.dmOwnerUid) || 0)
@@ -631,21 +639,26 @@ function reportMeta() {
    *   ② `channelComment` 开着；
    *   ③ 填了「要 @ 谁」。
    * ⚠️ 开关**存归存，行为按不可用处理**：人设为空时读取一律视为关，但不去改用户存的值。
+   * ⭐ 2026-11-10 修：额外回一个 `blockedBy`（persona / channel / mention / ''）给设置页——
+   *    `available` 是「这一轮到底发不发」，**不能**直接拿来当开关的 disabled：
+   *    开关自己关着时 available 也是 false，拿它置灰会把开关永远锁死（真机 bug）。
+   *    UI 只该按 `blockedBy === 'persona'` 置灰，另两种原因照实说。
    * @param {object} [persona]
-   * @returns {{available: boolean, reason: string}}
+   * @returns {{available: boolean, blockedBy: 'persona'|'channel'|'mention'|'', reason: string}}
    */
   const commentStateOf = (persona = personaNow()) => {
     if (!persona?.text) {
       return {
         available: false,
+        blockedBy: 'persona',
         reason: '人设留空 —— 不公开说话（即使「在视频下公开评论 @ 我」开着也不发）。要发评论，先在设置里填「人设提示词」或工作区的 AGENTS.md；私信不受影响',
       }
     }
     if (!cfg.channelComment) {
-      return { available: false, reason: '「在视频下公开评论 @ 我」关着 —— 这一轮不往任何评论区写字' }
+      return { available: false, blockedBy: 'channel', reason: '「在视频下公开评论 @ 我」关着 —— 这一轮不往任何评论区写字' }
     }
-    if (!String(cfg.mentionName || '').trim()) return { available: false, reason: '还没填「要 @ 谁」—— 评论存在的意义就是 @ 那一下' }
-    return { available: true, reason: '' }
+    if (!String(cfg.mentionName || '').trim()) return { available: false, blockedBy: 'mention', reason: '还没填「要 @ 谁」—— 评论存在的意义就是 @ 那一下' }
+    return { available: true, blockedBy: '', reason: '' }
   }
   /**
    * 内部术语命中时的账：写 duty.log + `stateDir/blocked-outbound.jsonl`（一行一条，便于测试与排查）。
@@ -1086,6 +1099,7 @@ function reportMeta() {
         transcribe: cfg.transcribe,
         commentAvailable: commentState.available,
         commentBlockedReason: commentState.reason,
+        commentBlockedBy: commentState.blockedBy,
       loggedIn: hasCredential(),
         home: stateDir,
         report: join(outDir, `${dayKey(now)}.md`),
@@ -1158,6 +1172,7 @@ function reportMeta() {
       + '队列：`{"collectBatch":3,"queueLimit":3,"queueTtlHours":24}`（一轮最多采几条 / 队列上限 / 保质期小时）；'
       + '投递：`{"deliverPerDay":5,"deliverMinGapMin":45,"deliverMaxGapMin":120,"quietStart":"23:00","quietEnd":"08:00","deliverRetries":1,"notifyOnFailure":true}`'
       + '（每天最多几条 / 随机间隔范围 / 免打扰起止 / 失败重试次数 / 故障通知；0 条 = 不自动投递）；'
+      + '显示：`{"showWatchTab":false}`（关掉对话页头部的「刷过的视频」tab；设置页里的历史照旧，默认开）；'
       + '⭐ 指定这一轮用哪个模型：`{"modelProvider":"deepseek-account","modelName":"deepseek-flash"}`'
       + '（两个都留空 = 跟随你当前会话选的模型；会话的 provider 这一轮没有时，改用 DeepSeek 兜底，并在 `status.model.sessionIgnored` 里标出来。'
       + '⭐ 这一轮能用哪些：DeepSeek 内置两条（`deepseek-account` / `deepseek-official`）+ 每轮从**主 profile** 的 `config.providers` 镜像过来的第三方 provider（按文件修改时间缓存，改了下一轮生效；密钥不复制）。'
@@ -1174,7 +1189,7 @@ function reportMeta() {
       return {
         ok: true, config: cfg, windows: WINDOWS, home: stateDir, venvReady: venvReadyNow(), host,
         channelDm: Boolean(cfg.channelDm), channelComment: Boolean(cfg.channelComment),
-        commentAvailable: cs.available, commentBlockedReason: cs.reason,
+        commentAvailable: cs.available, commentBlockedReason: cs.reason, commentBlockedBy: cs.blockedBy,
       }
     },
   })
@@ -1870,7 +1885,8 @@ function reportMeta() {
           + `\n\n⭐⭐ **每条挑中的候选用 \`duty_candidate_append(bvid, title, up, draft)\` 写进队列** —— 这是这一轮的主产物。`
           + `草稿（draft）就是**之后要用你的名义发给使用者的那段正文**：按人设写，说清这条是什么、为什么值得看；`
           + `**一条草稿控制在 400 字以内**（私信接口实测 500 字符就顶了）——`
-          + `**不许写内部术语 / 设置名 / 流程口径**（宿主发送前还会再机械检查一遍，命中就发不出去）。`
+          + `**不许写我们自己的设置名 / 内部字段 / 文件名 / 流程口径**（宿主发送前还会再机械检查一遍，命中就发不出去）；`
+          + `**视频本身在聊的行话照写**（「省 token」「上下文压缩」这类是内容，不是我们的内部字段）。`
           + `\n\n**日报**：不要写候选段（宿主会把队列写成日报的「队列」一节）；`
           + (cfg.reportLevel === 'off'
             ? '这一档连日报都不写。'
@@ -3691,9 +3707,11 @@ function reportMeta() {
       missingDeps: venvProbeNow().missing,
       dmUidResolved: Number(cfg.dmUid) || dmUidCache || 0,
       // ⭐ 2026-11 工单 04：人设是**唯一**的人格来源；公开评论要「人设非空」才可用。
-      //    commentAvailable / commentBlockedReason 给设置页置灰 + 说原因（08/10 直接用）。
+      //    commentAvailable 是「这一轮到底发不发」；设置页置灰只该看 commentBlockedBy === 'persona'，
+      //    否则开关自己关着时会被 available 锁死（2026-11-10 真机 bug）。
       commentAvailable: commentState.available,
       commentBlockedReason: commentState.reason,
+      commentBlockedBy: commentState.blockedBy,
       // ⭐ 2026-11 工单 08：两个渠道开关（人的选择）—— 行为按"人设为空 ⇒ 评论不可用"钳过，
       //    `channelComment` 原样报（存归存），能不能发看 commentAvailable。
       channelDm: Boolean(cfg.channelDm),
@@ -3736,6 +3754,11 @@ function reportMeta() {
   const manualDeliverMessage = (r = {}) => {
     const reason = String(r?.reason || '')
     const waitSec = Math.max(0, Math.ceil((Number(r?.waitMs) || 0) / 1000))
+    // ⭐ 2026-11-10（真机）：内容被拦不是投递故障 —— 别让人去查网络 / 登录 / 收件人
+    if (String(r?.status || '') === 'blocked' || r?.blocked === true) {
+      return '这条的正文没过发送前检查：' + (r?.error || '内容被拦')
+        + ' ⇒ 已跳过（不是网络 / 登录问题）。设置页的「队列」里能看到这条和命中的词'
+    }
     switch (reason) {
       case 'sent':
         return '已投递 ' + (r?.entry?.bvid || '') + '（手动投递，不占当天额度）'
@@ -3857,6 +3880,10 @@ function reportMeta() {
     // ⭐ 2026-10-23：这个会话是不是在「刷B站自己的工作区」里（设置里的 workspace；没配就不限制）。
     //    会话头那个「刷过的视频」tab 只在里面出现；壳子没有按会话隐藏的开关，所以由客户端拿这个结果
     //    决定注册不注册那个 view。查的是宿主 workspaceRegistry（list() 里的 sessionIds 已经是活的）。
+    // ⭐ 2026-11-10：响应里再交回「用户有没有把这一栏关掉」（config.showWatchTab）。
+    //    **`match` 的语义不变**（只表示工作区匹配）—— 范围与开关是两道独立的闸，客户端两个都满足才注册：
+    //      · 这样调试时能分清「为什么没显示」是工作区不对、还是用户自己关了；
+    //      · 老客户端只读 `match`，不受新字段影响。
     if (req.method === 'GET' && path === '/api/bili-duty/session-scope') {
       const sid = String(url.searchParams.get('session') || '').trim()
       const norm = (p) => String(p || '').replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase()
@@ -3876,6 +3903,7 @@ function reportMeta() {
         scope: want,
         workspace: hit,
         match: Boolean(!want || (sid && hit && norm(hit.path) === want)),
+        showWatchTab: Boolean(cfg.showWatchTab),
       })
     }
 
@@ -3936,11 +3964,18 @@ function reportMeta() {
       const wantRecipient = Number(cfg.dmUid) <= 0 && cfg.channelDm && String(cfg.mentionName || '').trim() !== ''
       const dmUidResolved = wantRecipient ? await warmDmUid({ force: true }) : (Number(cfg.dmUid) || 0)
       // ⭐ 工单 08：`channelComment` 存归存；人设留空时**读取时视为关**，把真实可用性与原因一并交回
-      const cs = commentStateOf(personaNow())
+      const persona = personaNow()
+      const cs = commentStateOf(persona)
       return sendJson(res, 200, {
         ok: true, config: cfg, host, dmUidResolved,
         channelDm: Boolean(cfg.channelDm), channelComment: Boolean(cfg.channelComment),
-        commentAvailable: cs.available, commentBlockedReason: cs.reason,
+        commentAvailable: cs.available, commentBlockedReason: cs.reason, commentBlockedBy: cs.blockedBy,
+        // ⭐ 2026-11-10 修：把这几个也回给设置页 —— 刚保存完人设就立刻显示「已就位」，
+        //    不用等下一次 /status 轮询（最多 5 秒），也就不会出现"明明填了却说没就位"的空窗。
+        personaPresent: Boolean(persona.text),
+        personaSource: persona.source,
+        personaLength: persona.text.length,
+        personaTruncated: persona.truncated,
       })
     }
 

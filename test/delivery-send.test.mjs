@@ -180,14 +180,14 @@ test('四种回执形态各自落一条账，字段齐全', async (t) => {
 
 /* ─────────── blocked：机械检查在进 MCP 之前 ─────────── */
 
-test('blocked：内部术语命中 ⇒ 不发、不起 MCP、账本写可读原因', async () => {
+test('blocked：内部标识符命中 ⇒ 不发、不起 MCP、账本写可读原因', async () => {
   const h = host()
   h.setMode('ok')
   const r = await h.deliver({ uid: 12345, text: '这条草稿里写了投递账三个字', bvid: BVID_A, manual: false })
   assert.equal(r.ok, false)
   assert.equal(r.status, 'blocked')
   assert.equal(r.blocked, true)
-  assert.match(r.reason, /内部术语|检查/)
+  assert.match(r.reason, /内部标识符|检查/)
   assert.equal(h.stats(), null, 'blocked 不该启动 MCP')
   assert.equal(h.ledger().length, 1)
   const rec = h.ledger()[0]

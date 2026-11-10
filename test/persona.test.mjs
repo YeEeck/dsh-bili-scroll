@@ -10,7 +10,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { dayKey } from '../lib/state.mjs'
 import { PERSONA_LIMIT, looksLikePersonaPath, personaForPrompt } from '../lib/persona.mjs'
-import { checkOutboundText } from '../lib/outbound.mjs'
+import { ASCII_TERMS, CJK_TERMS, PLAIN_FIELD_NAMES, checkOutboundText } from '../lib/outbound.mjs'
 
 const root = mkdtempSync(join(tmpdir(), 'bili-persona-'))
 const dirOf = (name) => { const d = join(root, name); mkdirSync(d, { recursive: true }); return d }
@@ -114,14 +114,50 @@ test('personaForPrompt：多行、以 / 开头的文字按正文处理，不尝�
 
 /* ───────────────────────── 纯函数：出站检查 ───────────────────────── */
 
-test('checkOutboundText：覆盖设置名 / 渠道取值 / 内部字段 / 台账口径', () => {
-  const terms = ['dmMode', 'only', 'both', 'perDay', '判重表', '白名单', 'prompt', 'token',
-    '复核', '采集轮', '队列', '投递账', 'overlay', 'profile']
+test('checkOutboundText：覆盖设置名 / 内部字段 / 内部文件名 / 台账口径', () => {
+  const terms = ['dmMode', 'channelDm', 'tasteBrief', 'perDay', '判重表', '采集轮', '投递账',
+    'rpid', 'msgKey', 'seen.md', 'duty.log', 'NO_ADAPTER']
   for (const term of terms) {
     const r = checkOutboundText('这句里带了 ' + term + ' 这个词')
     assert.equal(r.ok, false, term + ' 应该被挡')
     assert.ok(r.hits.includes(term), term + ' 应该出现在 hits 里：' + JSON.stringify(r.hits))
     assert.ok(r.reason.includes(term), '原因要指出命中的词')
+  }
+})
+
+test('checkOutboundText：2026-11-10 真机那两段草稿必须放行（「省 40% token」被误挡过）', () => {
+  // 原文取自 ~/.dsh/bili-duty 的 queue.json：两段正常中文推荐语，只因为聊的是省 token 就被拦下
+  const drafts = [
+    '那个号称省40%token的DSH-OPS，有人拿110道题跑了一千九百多次把它扒了：分数没涨，token反而多4.4%，'
+      + '用时还长两小时，连"每次调用复制800兆"都核对过。正打算装的话先看这条 BV1ScW864ETj',
+    'Live Compact的作者录了24分钟讲设计：从QKV和注意力讲起，说清为什么2万token就切、切掉的东西存哪、'
+      + '模型怎么顺着指针回读，还跟另一个压缩方案逐项对比。想知道上下文压缩到底在压什么，这条比翻文档快 BV1hBW86wEEj',
+  ]
+  for (const draft of drafts) {
+    const r = checkOutboundText(draft)
+    assert.equal(r.ok, true, '正常行话不该被挡：' + JSON.stringify(r.hits))
+  }
+})
+
+test('checkOutboundText：日常技术词不是内部术语（token / prompt / profile / 白名单 / 队列 / 宿主 / 复核）', () => {
+  const everyday = ['省 token', 'prompt 工程', 'profile 页面', 'overlay 效果', 'persona 语气',
+    'only / both', 'workspace 目录', '关键词 keywords', '转写 transcribe',
+    '白名单', '队列', '宿主', '复核', '上下文水位']
+  for (const word of everyday) {
+    assert.equal(checkOutboundText('这条讲的是 ' + word + '，挺清楚').ok, true, word + ' 不该被挡')
+  }
+})
+
+test('词表守卫：英文词必须长得像标识符，纯小写单词只能在白名单里', () => {
+  const looksLikeId = (s) => /[A-Z0-9_.\-]/.test(s)
+  for (const term of ASCII_TERMS) {
+    if (PLAIN_FIELD_NAMES.includes(term)) continue
+    assert.ok(looksLikeId(term), '纯小写英文单词不许进表（会误伤正常行话）：' + term)
+  }
+  // 中文词只收我们自己的产物名：日常/技术通用词不许回归
+  const generic = ['白名单', '队列', '宿主', '复核', '术语', '流程']
+  for (const word of generic) {
+    assert.ok(!CJK_TERMS.includes(word), word + ' 是通用词，不许进内部术语表')
   }
 })
 
@@ -237,16 +273,37 @@ test('bili_reply：人设留空 ⇒ 即使「自动评论」开着也挡下，�
 
   const st = await h.call('GET', '/api/bili-duty/status')
   assert.equal(st.commentAvailable, false)
+  assert.equal(st.commentBlockedBy, 'persona')
   assert.match(st.commentBlockedReason, /人设留空/)
   assert.equal(st.personaPresent, false)
 })
 
+test('2026-11-10 真机：人设已填 + 公开评论开关关着 ⇒ 原因是「开关关着」，不能误报「人设留空」', async () => {
+  const h = startHost({ cfg: { personaPrompt: '叫我阿七，说话短一点', channelDm: true, channelComment: false, mentionName: '阿七' } })
+  const st = await h.call('GET', '/api/bili-duty/status')
+  assert.equal(st.personaPresent, true, '人设已经保存 ⇒ 不能再说没就位')
+  assert.equal(st.channelComment, false)
+  assert.equal(st.commentAvailable, false, '开关关着 ⇒ 这一轮确实不发')
+  assert.equal(st.commentBlockedBy, 'channel')
+  assert.match(st.commentBlockedReason, /关着/)
+  assert.ok(!st.commentBlockedReason.includes('人设留空'), '开关关着 ≠ 人设留空（设置页据此显示原因）')
+})
+
+test('人设已填 + 公开评论开着 + 没填「要 @ 谁」⇒ blockedBy=mention', async () => {
+  const h = startHost({ cfg: { personaPrompt: '叫我阿七', channelDm: true, channelComment: true, mentionName: '' } })
+  const st = await h.call('GET', '/api/bili-duty/status')
+  assert.equal(st.personaPresent, true)
+  assert.equal(st.commentAvailable, false)
+  assert.equal(st.commentBlockedBy, 'mention')
+  assert.match(st.commentBlockedReason, /要 @ 谁/)
+})
+
 test('bili_reply：内部术语命中 ⇒ 不发、返回命中的词、写审计与 duty.log（force 也不越过）', async () => {
   const h = startHost({ cfg: { personaPrompt: '叫我阿七，说话短一点', ...commentOnCfg } })
-  const r = await h.tool('bili_reply').execute({ bvid: 'BV1aaaaaaaaa', text: '这条我认，dmMode 就是 only' })
+  const r = await h.tool('bili_reply').execute({ bvid: 'BV1aaaaaaaaa', text: '这条我认，dmMode 是 channelDm' })
   assert.equal(r.ok, false)
   assert.equal(r.blocked, true)
-  assert.ok(r.hits.includes('dmMode') && r.hits.includes('only'), JSON.stringify(r.hits))
+  assert.ok(r.hits.includes('dmMode') && r.hits.includes('channelDm'), JSON.stringify(r.hits))
   assert.match(r.reason, /dmMode/)
   assert.match(h.logText(), /评论被挡下/, 'duty.log 要留下被挡的记录')
 
@@ -254,16 +311,17 @@ test('bili_reply：内部术语命中 ⇒ 不发、返回命中的词、写审�
   assert.equal(rows.length, 1)
   assert.equal(rows[0].bvid, 'BV1aaaaaaaaa')
   assert.ok(rows[0].hits.includes('dmMode'))
-  assert.match(rows[0].reason, /内部术语/)
+  assert.match(rows[0].reason, /内部标识符/)
   assert.ok(!Number.isNaN(Date.parse(rows[0].at)), '审计记录要有时间')
 
   // force 只越过"配置闸"，不越过机械检查
-  const rf = await h.tool('bili_reply').execute({ bvid: 'BV1bbbbbbbbb', text: '白名单里没有它', force: true })
+  const rf = await h.tool('bili_reply').execute({ bvid: 'BV1bbbbbbbbb', text: '判重表里没有它', force: true })
   assert.equal(rf.blocked, true)
   assert.equal(h.audit().length, 2)
 
   const st = await h.call('GET', '/api/bili-duty/status')
   assert.equal(st.commentAvailable, true)
+  assert.equal(st.commentBlockedBy, '')
   assert.equal(st.commentBlockedReason, '')
   assert.equal(st.personaPresent, true)
 })

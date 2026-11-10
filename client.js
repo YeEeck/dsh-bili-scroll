@@ -462,6 +462,10 @@ function WatchTab() {
         setMsg(text); setMsgTone(tone || '')
       }
 
+      /* ⭐ 2026-11-10：POST /config 的返回里带「保存后的宿主实情」——人设刚保存完就合并进 st，
+       *    页面立刻显示"已就位"，不用等下一次 5 秒轮询（那几秒正是"明明填了却说没就位"的空窗）。 */
+      const STATUS_AFTER_SAVE = ['commentBlockedReason', 'commentBlockedBy',
+        'personaPresent', 'personaSource', 'personaLength', 'personaTruncated']
       const patch = async (p, what) => {
         setOptim((old) => ({ ...old, ...p }))          // 先亮起来
         // ⭐ 2026-10-28：宿主每次保存都要顺手同步进 DSH 原生设置，几百毫秒回不来 ⇒
@@ -469,7 +473,11 @@ function WatchTab() {
         say(`${what || '设置'}：保存中…`, '')
         try {
           const r = await jpost('/config', p)
-          if (r?.config) setSt((old) => ({ ...old, config: r.config }))
+          if (r?.config) setSt((old) => {
+            const next = { ...old, config: r.config }
+            for (const k of STATUS_AFTER_SAVE) if (r[k] !== undefined) next[k] = r[k]
+            return next
+          })
           // ⭐ 2026-10-25：保存后让「刷过的视频」tab 重查工作区（改 workspace 时 tab 要跟着挪）
           try { bumpScope() } catch { /* 忽略 */ }
           // ⭐ DSH 原生设置页里显式设过的键由宿主说了算 ⇒ 我们这份也得写进去；写失败要说出来，别假装"已保存"
@@ -775,14 +783,27 @@ function WatchTab() {
 
       // 点了先变，别等网络回来（宿主写 DSH 设置那一步可能要几百毫秒）
       const sw = (k) => Boolean(k in optim ? optim[k] : cfg[k])
+      /* ⭐ 2026-11-10：会话头 tab 开关。旧宿主（升级后还没重启）的 /status.config 里没有这个键，
+       *    此时开关要置灰并说清原因 —— 否则点了照样回「已保存」，实际什么都不会发生。 */
+      const tabCfgKnown = Boolean(cfg && 'showWatchTab' in cfg)
       // ⭐ 工单 08：人设留空 ⇒ 公开评论不可用（置灰 + 说原因；**不改用户存的值**，行为和 UI 按不可用处理）
-      const personaMissing = Boolean(st && st.personaPresent === false)
-      /* ⭐ 工单 10：「公开评论」能不能用**只看宿主**（/status.commentAvailable / commentBlockedReason）——
-       *    不能只看 channelComment（那只是"用户存的开关"，人设空着时存着开也不会发）。
-       *    老宿主没有这两个字段时退回 personaPresent 的判断，别把开关一律置灰。 */
-      const commentAvailable = st?.commentAvailable !== false && !personaMissing
-      const personaNote = String(st?.commentBlockedReason || '')
-        || (personaMissing ? '人设提示词是空的' : '人设提示词读不到')
+      /* ⭐ 2026-11-10 修（真机）：置灰**只看人设**，不能拿 commentAvailable 当 disabled ——
+       *    commentAvailable 是「这一轮到底发不发」（人设 · 开关 · 「要 @ 谁」三条都满足才 true），
+       *    开关自己关着时它也 false ⇒ 开关会被自己锁死，永远打不开。
+       *    原因用宿主给的 commentBlockedBy（persona / channel / mention）分开说；
+       *    老宿主没有这个字段时退回 personaPresent 的判断，别把开关一律置灰。 */
+      const personaMissing = Boolean(st && (st.personaPresent === false || st.commentBlockedBy === 'persona'))
+      const mentionMissing = !String(cfg?.mentionName || '').trim()
+      const personaNote = personaMissing
+        ? (String(st?.commentBlockedReason || '') || '人设提示词是空的')
+        : ''
+      // 人设那块要显示"已保存/已读取多少字" —— 来源不同，说法也不能一样
+      const personaSavedLen = Number(st?.personaLength) || 0
+      const personaStateText = st?.personaSource === 'file'
+        ? '已读取文件 ' + personaSavedLen + ' 字'
+        : st?.personaSource === 'workspace'
+          ? '读自工作区的 AGENTS.md（' + personaSavedLen + ' 字）'
+          : (personaSavedLen > 0 ? '已保存 ' + personaSavedLen + ' 字' : '已生效')
 
       /* ⭐ 2026-10-23：模型下拉 —— 值用 `provider|model` 拼成一个字符串，
        *    这样「跟随当前会话」（空值）和"钉死某一个"用同一个 select 就能表达。 */
@@ -1090,6 +1111,17 @@ function WatchTab() {
          *    但一直是设置页的正式入口（会话头也有同名 tab），不能弄丢。 ── */
         h('div', { 'data-bd-sec': '', 'data-bd-group': 'daily', 'data-bd-away': tab === 'daily' ? undefined : '' },
           h('div', { 'data-bd-h': '' }, '它刷过的视频（历史）'),
+          /* ⭐ 2026-11-10：这一栏 tab 的显示开关（默认开）。只影响**对话页顶部**；
+           *    关掉后下面这个历史列表、封面、筛选照旧 —— 所以开关放在这里，用户一眼知道"关掉的只是 tab"。 */
+          h(ToggleRow, {
+            label: '在会话头显示「刷过的视频」',
+            note: tabCfgKnown
+              ? '默认开。关掉之后对话页顶部不再有这一栏 tab；下面这个历史列表、封面和筛选照旧。'
+              : '宿主还是旧版（升级后还没重启）—— 这一项要重启一次 dsh 后才会生效。',
+            on: sw('showWatchTab'),
+            disabled: !tabCfgKnown,
+            onChange: (v) => patch({ showWatchTab: v }, '会话头 tab'),
+          }),
           h('div', { 'data-bd-row': '' },
             h('button', { 'data-bd-btn': '', disabled: busy === 'watched', onClick: () => (watchedRows !== null ? setWatchedRows(null) : onLoadWatched(watchedState, watchedTier, watchedOffset)) },
               watchedRows !== null ? '收起' : '看它刷过什么'),
@@ -1120,7 +1152,7 @@ function WatchTab() {
 
         /* ══════════════ 互动 · 发给谁 / 公开评论 / 私信双向 ══════════════
          * ⭐ 工单 10：「公开评论」从「日常」挪到这儿，并和人设绑定 —— 人设为空时置灰 + 说原因
-         *    （判据用 /status.commentAvailable / commentBlockedReason，不是只看 channelComment）。 */
+         *    （判据是 personaMissing / commentBlockedBy，不是 commentAvailable；见上面 2026-11-10 的修）。 */
         h('div', { 'data-bd-sec': '', 'data-bd-group': 'social', 'data-bd-away': tab === 'social' ? undefined : '' },
           h('div', { 'data-bd-h': '' }, '发给谁 / @ 谁'),
           h('div', { 'data-bd-label': '' }, 'B站 昵称'),
@@ -1141,18 +1173,20 @@ function WatchTab() {
           h('div', { 'data-bd-h': '' }, '公开评论（在视频下 @ 我）'),
           h(ToggleRow, {
             label: '在视频下公开评论 @ 我',
-            note: commentAvailable
-              ? '默认关。公开，别人也看得见；每条评论里 @ 一次上面那个人。'
-              : '置灰：' + personaNote + '。人设留空时它不公开说话。',
+            note: personaMissing
+              ? '置灰：' + personaNote + '。人设留空时它不公开说话。'
+              : mentionMissing
+                ? '可以打开；但上面的「B站 昵称（要 @ 谁）」还空着 —— 打开也不会发，先填昵称。'
+                : '默认关。公开，别人也看得见；每条评论里 @ 一次上面那个人。',
             on: sw('channelComment'),
-            disabled: !commentAvailable,
+            disabled: personaMissing,
             onChange: (v) => patch({ channelComment: v }, '公开评论'),
           }),
-          !commentAvailable ? h('div', { 'data-bd-msg': '' },
+          personaMissing ? h('div', { 'data-bd-msg': '' },
             '为什么置灰：' + personaNote + '。想让它在视频下说话，先在「偏好 → 它按什么说话（人设提示词）」里写一段，或填一个文件路径。') : null,
-          (!commentAvailable && sw('channelComment')) ? h('div', { 'data-bd-msg': '', 'data-warn': '' },
-            '「公开评论」存着是开，但现在不会发：' + personaNote) : null,
-          (commentAvailable && sw('channelComment')) ? h('div', { 'data-bd-sub': '' },
+          (!personaMissing && sw('channelComment') && mentionMissing) ? h('div', { 'data-bd-msg': '', 'data-warn': '' },
+            '「公开评论」开着，但现在不会发：还没填上面那个「B站 昵称（要 @ 谁）」—— 评论存在的意义就是 @ 那一下。') : null,
+          (!personaMissing && sw('channelComment')) ? h('div', { 'data-bd-sub': '' },
             h('div', { 'data-bd-row': '' },
               h('div', { 'data-bd-grow': '' },
                 h('div', { 'data-bd-label': '' }, '每轮最多发几条评论'),
@@ -1304,11 +1338,18 @@ function WatchTab() {
             (st.personaFromWs && String(persona || '').trim() === '')
               ? '你现在还是用「工作区」里那份 AGENTS.md 说话的（照旧生效）。想把它搬到这儿改，就把上面的路径填成本机那个目录。'
               : '改完点上面那个「保存」；下一轮就按这个说话。'),
-          // ⭐ 工单 10：人设与「互动 → 公开评论」的置灰说明必须是同一套口径（都来自 /status.commentAvailable）
+          // ⭐ 2026-11-10 修：别再不管原因都写「人设还没就位」——
+          //    人设非空时必须明确说「已就位」，再按当前渠道状态补一句（关着 / 缺 @ 谁 / 可以发）。
+          //    置灰判据与上面「互动 → 公开评论」是同一套（personaMissing / mentionMissing）。
           h('div', { 'data-bd-note': '' },
-            commentAvailable
-              ? '人设已就位 ⇒ 「互动」里的「公开评论」可以打开。'
-              : '人设还没就位（' + personaNote + '）⇒ 「互动」里的「公开评论」现在置灰。')),
+            personaMissing
+              ? '人设还没就位（' + personaNote + '）⇒ 「互动」里的「公开评论」现在置灰。'
+              : '✅ 人设已就位（' + personaStateText + '）。'
+                + (!sw('channelComment')
+                  ? '「互动」里的「公开评论」现在是关的 —— 想让它去评论区说话，去打开就行（人设已经是好的）。'
+                  : mentionMissing
+                    ? '「互动」里的「公开评论」开着，但「要 @ 谁」还空着 —— 现在不会发。'
+                    : '「互动」里的「公开评论」可以发。'))),
 
         /* ══════════════ 偏好 · 日报与收藏 ══════════════ */
         h('div', { 'data-bd-sec': '', 'data-bd-group': 'taste', 'data-bd-away': tab === 'taste' ? undefined : '' },
@@ -1351,7 +1392,8 @@ function WatchTab() {
               ? h('option', { value: wsValue }, wsValue + '（当前设置，不在列表里）') : null),
           h('div', { 'data-bd-note': '' },
             '采集轮就跑在这个目录里：会话会归到这个工作区（而不是侧栏「未分组」）、它的 AGENTS.md 会作为人设参考，'
-            + '「刷过的视频」tab 也只在这个工作区的会话里出现。'),
+            + '「刷过的视频」tab 也只在这个工作区的会话里出现。'
+            + '（想连这一栏都不要，去「日常 → 它刷过的视频（历史）」把那个开关关掉。）'),
           wsList === null ? h('div', { 'data-bd-note': '' }, '工作区列表读取中…') : null,
           (wsList && wsList.length === 0) ? h('div', { 'data-bd-note': '' }, 'DSH 里还没建过工作区 —— 先在左侧新建一个，再回来选。') : null),
 
@@ -1546,6 +1588,8 @@ function WatchTab() {
   //        回答这个会话是不是在「刷B站 设置里的 workspace」（默认 D:/hajimi）那个工作区里；
   //      · 是 ⇒ 注册「刷过的视频」；不是 ⇒ 立刻撤销（tab 跟着消失）。
   //    这样：hajimi 工作区里的会话有 tab，别的会话（比如 default-workspace）没有。
+  //    ⭐ 2026-11-10：再加一道用户开关（设置里的 `showWatchTab`）—— 关掉时，**即使工作区匹配**也不注册。
+  //      开关值由同一个 /session-scope 响应交回来（`showWatchTab`），两道闸都满足才显示。
   try {
     let viewOff = null
     let viewSlotReady = false
@@ -1588,12 +1632,28 @@ function WatchTab() {
       }, [])
       React.useEffect(() => {
         const sid = String(sessionId || '')
-        // 拿不到 sessionId（槽位没给 / 老版本）：退回老行为 —— 照常显示，别把 tab 弄没了
-        if (!sid) { lastInScope = true; ensureView(); return () => {} }
-        const hit = scopeCache.get(sid)
-        if (hit && Date.now() - hit.at < SCOPE_TTL) {
-          if (hit.v) { lastInScope = true; ensureView() } else dropView()
-          return () => {}
+        // ⭐ 2026-11-10：现在是**两道闸** —— 工作区匹配（match）与用户开关（showWatchTab）都过了才注册。
+        //    · 老宿主没有 showWatchTab ⇒ 当作开（保持老行为，别静默把 tab 藏掉）；
+        //    · 拿不到 sessionId（槽位没给 / 老版本）⇒ 只认开关，不认 match（没 sid 问不出工作区）。
+        const applyScope = (r) => {
+          const show = (r?.showWatchTab !== false) && (sid ? Boolean(r.match) : true)
+          lastInScope = show
+          if (sid) scopeCache.set(sid, { v: show, at: Date.now() })
+          if (show) ensureView(); else dropView()
+        }
+        // 老宿主 / 请求失败：退回老行为 —— 照常显示；一次网络抖动不该把 tab 永久藏掉
+        const showFallback = () => {
+          lastInScope = true
+          if (sid) scopeCache.set(sid, { v: true, at: Date.now() })
+          ensureView()
+        }
+        if (sid) {
+          const hit = scopeCache.get(sid)
+          if (hit && Date.now() - hit.at < SCOPE_TTL) {
+            lastInScope = hit.v
+            if (hit.v) ensureView(); else dropView()
+            return () => {}
+          }
         }
         // 没缓存 / 缓存过期：先收起来（宁可晚一帧出现，也别让 tab 在别的会话上闪），再问宿主
         dropView()
@@ -1602,13 +1662,10 @@ function WatchTab() {
           .then((r) => {
             if (!alive) return
             // 老宿主没有这个接口（r.ok 不是 true）⇒ 退回老行为，别静默把 tab 藏掉
-            if (!r || r.ok !== true) { lastInScope = true; scopeCache.set(sid, { v: true, at: Date.now() }); ensureView(); return }
-            const inScope = Boolean(r.match)
-            lastInScope = inScope
-            scopeCache.set(sid, { v: inScope, at: Date.now() })
-            if (inScope) ensureView(); else dropView()
+            if (!r || r.ok !== true) { showFallback(); return }
+            applyScope(r)
           })
-          .catch(() => { if (alive) { lastInScope = true; scopeCache.set(sid, { v: true, at: Date.now() }); ensureView() } })
+          .catch(() => { if (alive) showFallback() })
         return () => { alive = false }
       }, [sessionId, nonce])
       // 探针被卸载（切到没有会话的首页 / 别的面板）⇒ 把 tab 收起来

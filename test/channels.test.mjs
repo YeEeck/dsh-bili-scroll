@@ -327,6 +327,7 @@ test('桩宿主：人设为空 + channelComment=true ⇒ 读取时视为关（/s
   const h = startHost({ cfg: { channelDm: true, channelComment: true, mentionName: '阿七' } })
   const st = await statusApi(h)
   assert.equal(st.commentAvailable, false)
+  assert.equal(st.commentBlockedBy, 'persona')
   assert.equal(st.channelComment, true, '用户存的值不改')
   assert.match(st.commentBlockedReason, /人设留空/)
 
@@ -335,4 +336,16 @@ test('桩宿主：人设为空 + channelComment=true ⇒ 读取时视为关（/s
   assert.equal(reply.blocked, true)
   assert.match(reply.reason, /人设留空/)
   assert.equal(h.savedCfg().channelComment, true, '不能偷偷把用户存的值改成 false')
+})
+
+test('2026-11-10：POST /config 打开公开评论 ⇒ 返回 blockedBy 为空 + 人设状态（设置页保存后立刻刷新）', async () => {
+  const h = startHost({ cfg: { personaPrompt: '叫我阿七', channelDm: true, channelComment: false, mentionName: '阿七' } })
+  const r = await h.call('POST', '/api/bili-duty/config', { channelComment: true })
+  assert.equal(r.ok, true)
+  assert.equal(r.channelComment, true)
+  assert.equal(r.commentAvailable, true)
+  assert.equal(r.commentBlockedBy, '')
+  assert.equal(r.personaPresent, true)
+  assert.equal(r.personaSource, 'text')
+  assert.equal(r.personaLength, '叫我阿七'.length)
 })

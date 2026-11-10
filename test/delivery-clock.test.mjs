@@ -317,12 +317,12 @@ test('失败：5 分钟内不重试；到点重试一次；再失败标 failed�
 
 /* ───────────── ⑥ blocked 不重试；busy 不落账、不占次数 ───────────── */
 
-test('blocked：正文没过机械检查 ⇒ 直接 failed，不重试', async () => {
+test('blocked：正文没过机械检查 ⇒ 直接 failed、不重试，而且**不算投递故障**', async () => {
   const dir = newDir()
   const now = at(10, 0)
-  putQueue(dir, [entry(A, now)])
+  putQueue(dir, [entry(A, now), entry(B, now), entry(C, now)])
   const h = makeClock({ dir, cfg: { deliverRetries: 3 }, nowRef: () => now, mode: 'blocked' })
-  const r = await h.clock.tick()
+  let r = await h.clock.tick()
   assert.equal(r.ok, false)
   assert.equal(r.reason, 'sent-failed')
   assert.equal(r.attempts, 1, 'blocked 不占重试机会')
@@ -330,6 +330,17 @@ test('blocked：正文没过机械检查 ⇒ 直接 failed，不重试', async (
   const a = queueOf(dir)[0]
   assert.equal(a.status, 'failed')
   assert.match(a.lastError, /内部术语/)
+
+  // ⭐ 2026-11-10（真机）：连续挡下 3 条也不许变成「投递连续失败」——
+  //    那条通知的含义是「网络 / B站 登录 / 收件人」有问题，内容被拦跟它们没关系。
+  assert.ok(DELIVERY_FAILURE_NOTIFY_THRESHOLD <= 3, '这条断言依赖阈值不超过 3')
+  await h.clock.tick()
+  await h.clock.tick()
+  assert.equal(h.calls.length, 3)
+  const st = readJsonFile(deliveryClockPaths(dir).state) || {}
+  assert.equal(Number(st.consecutiveFailures) || 0, 0, 'blocked 不计入连续失败')
+  assert.deepEqual(notesOf(dir), [], 'blocked 不触发故障通知')
+  assert.match(h.logs.join('\n'), /内容被拦，不计入投递连续失败/)
 })
 
 test('busy：另一个宿主正在发 ⇒ 这一跳跳过，不落账、不增 attempts、条目仍 pending', async () => {

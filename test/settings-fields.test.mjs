@@ -49,6 +49,7 @@ function configKeys() {
 /** 只保留「代码行」：整行注释（`//` / `*` / `/*` 开头）不算入口。 */
 const codeOnly = (src) => src.split(/\r?\n/).filter((l) => !/^\s*(\/\/|\*|\/\*)/.test(l)).join('\n')
 const clientCode = codeOnly(clientSrc)
+const indexCode = codeOnly(indexSrc)
 const keys = configKeys()
 
 /** 工单 10 这一轮新增 / 明确要求可配的字段（每一项都必须在设置页里能改）。 */
@@ -81,7 +82,7 @@ const HIDDEN_FIELDS = ['peakValley', 'noon', 'night', 'dmMode', 'autoComment']
 const STATUS_FIELDS = [
   'nextCollectAt', 'lastCollectAt', 'deliveredToday', 'lastDelivery', 'notifications',
   'queuePending', 'queueEmpty', 'queueFullHint', 'queueLimit',
-  'commentAvailable', 'commentBlockedReason',
+  'commentBlockedReason', 'commentBlockedBy',
   'manualCollectCooldownRemainingMs', 'manualDeliverCooldownRemainingMs',
   'modelMirror', 'modelWhy',
 ]
@@ -121,4 +122,30 @@ test('工单 10：「日常」按采集 / 投递 / 今天三块分区，字段�
   assert.deepEqual(badStatus, [], '这些 /status 字段页面没接上：' + badStatus.join('、'))
   const badQueue = QUEUE_FIELDS.filter((k) => !mentions(clientCode, k))
   assert.deepEqual(badQueue, [], '这些 /queue 字段页面没接上：' + badQueue.join('、'))
+})
+
+/* ⭐ 2026-11-10 真机回归：人设已经填了，设置页却写「人设还没就位」，而且「公开评论」开关
+ *    被自己的关状态锁死（disabled 用了 commentAvailable，而它要求开关本身是开的）。
+ *    这里只看代码形状（不渲染）：置灰判据必须是人设，不能是 commentAvailable。 */
+test('公开评论置灰只看人设；开关不能因为自己关着而永远打不开', () => {
+  const i = clientCode.indexOf("label: '在视频下公开评论 @ 我'")
+  assert.ok(i >= 0, '设置页里找不到公开评论开关')
+  const seg = clientCode.slice(i, i + 900)
+  assert.ok(!/disabled:\s*!commentAvailable/.test(seg), '拿 commentAvailable 当 disabled ⇒ 开关关着时永远打不开')
+  assert.match(seg, /disabled:\s*personaMissing/, '置灰判据要用人设（personaMissing）')
+  assert.ok(clientCode.includes('commentBlockedBy'), '原因要用 /status 的结构化字段 commentBlockedBy')
+  assert.ok(clientSrc.includes('✅ 人设已就位'), '人设非空时要明确告诉用户「已就位」')
+})
+
+/* ────────────── 3.1.0：会话头「刷过的视频」开关 ────────────── */
+
+test('3.1.0：showWatchTab 在配置里、在设置页里，也在 /session-scope 的契约里', () => {
+  // 配置（Config；schemastery 拿不到时退回 DEFAULTS）—— 缺了 ⇒ 宿主设置表里没有它
+  assert.ok(keys.has('showWatchTab'), '配置里要有 showWatchTab（Config 与 DEFAULTS 都要）')
+  // 设置页的开关（日常 → 它刷过的视频（历史））
+  assert.ok(mentions(clientCode, 'showWatchTab'), '设置页里没有改 showWatchTab 的入口')
+  // 宿主 /session-scope 的响应字段 + 客户端探针的判据 —— 改名必须两边一起改，
+  // 否则 tab 会「关不掉」或「永远不显示」，而且没有别的单测会红。
+  assert.ok(/showWatchTab:\s*Boolean\(cfg\.showWatchTab\)/.test(indexCode), '/session-scope 的响应里没有 showWatchTab —— 客户端拿不到开关')
+  assert.ok(/showWatchTab\s*!==\s*false/.test(clientCode), '客户端探针没有按 showWatchTab 决定注册不注册')
 })

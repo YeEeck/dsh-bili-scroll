@@ -298,6 +298,7 @@ test('POST /deliver-now：病态长的草稿 ⇒ 挡在发送之前（账本记 
   assert.equal(r.status, 'blocked')
   assert.equal(r.reason, 'sent-failed', 'blocked 重试也不会好 ⇒ 直接放弃这条')
   assert.match(r.message, /异常长/)
+  assert.match(r.message, /不是网络/, '内容被拦要说清不是网络 / 登录问题，别把人指错方向')
 
   const ledger = h.ledger()
   assert.equal(ledger.length, 1, 'blocked 也要落一条账')
